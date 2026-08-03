@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_DIR = SCRIPT_DIR.parent
+PROJECT_DIR = SCRIPT_DIR.parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 MODEL_DIR = PROJECT_DIR / "model"
 
@@ -20,19 +20,19 @@ TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.001-train.npz"
 TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.001-test.npz"
 MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.001"
 
-WIDTHS = [16, 16]
+WIDTHS = [32, 32]
 LEARNING_RATE = 1e-3
-GRAD_WEIGHT = 5.0
+GRAD_WEIGHT = 10.0
 L2_REG = 0.0
-BATCH_SIZE = 32
-EPOCHS = 2000
+BATCH_SIZE = 64
+EPOCHS = 5000
 SEED = 0
 NORMALIZATION_EPS = 1e-8
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from learning.ICNN import (
+from icnn import (
     act_p,
     batched_forward,
     batched_grad_wrt_x,
@@ -172,9 +172,9 @@ if __name__ == "__main__":
     norm_val_mse, norm_grad_mse = evaluate_normalized(params, Xva_norm, yva_norm, gva_norm)
     val_mse, grad_mse = evaluate(params, Xva, yva, gva, normalization)
     print(
-        f"[TEST normalized] value MSE: {norm_val_mse:.4e} "
+        f"[TEST] value MSE: {norm_val_mse:.4e} "
         f"| grad MSE: {norm_grad_mse:.4e}"
     )
-    print(f"[TEST original] value MSE: {val_mse:.4e} | grad MSE: {grad_mse:.4e}")
+    # print(f"[TEST original] value MSE: {val_mse:.4e} | grad MSE: {grad_mse:.4e}")
 
     save_model(prepare_for_export(params, rho, normalization), MODEL_PATH)

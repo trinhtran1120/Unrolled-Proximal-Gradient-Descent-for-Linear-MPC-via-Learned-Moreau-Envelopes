@@ -242,31 +242,26 @@ def train_icnn(
 
         if epoch % max(1, epochs // 10) == 0 or epoch == 1:
             with jax.disable_jit():
-                yp = batched_forward(params, Xj[:1024])
-                gp = batched_grad_wrt_x(params, Xj[:1024])[:, : gj.shape[1]]
-                vm = jnp.mean((yp - yj[:1024]) ** 2)
-                gm = jnp.mean(jnp.sum((gp - gj[:1024]) ** 2, axis=1))
-                selection_obj = vm + grad_weight * gm
-                log_message = (
-                    f"Epoch {epoch:4d} | train value MSE: {vm:.4e} "
-                    f"| train grad MSE: {gm:.4e}"
-                )
-
                 if has_validation:
-                    yvp = batched_forward(params, Xvj)
-                    gvp = batched_grad_wrt_x(params, Xvj)[:, : gvj.shape[1]]
-                    vvm = jnp.mean((yvp - yvj) ** 2)
-                    vgm = jnp.mean(jnp.sum((gvp - gvj) ** 2, axis=1))
-                    selection_obj = vvm + grad_weight * vgm
-                    log_message = (
-                        f"{log_message} | val value MSE: {vvm:.4e} "
-                        f"| val grad MSE: {vgm:.4e}"
-                    )
+                    eval_X, eval_y, eval_g = Xvj, yvj, gvj
+                    metric_label = "val"
+                else:
+                    eval_X, eval_y, eval_g = Xj[:1024], yj[:1024], gj[:1024]
+                    metric_label = "train"
+
+                yp = batched_forward(params, eval_X)
+                gp = batched_grad_wrt_x(params, eval_X)[:, : eval_g.shape[1]]
+                vm = jnp.mean((yp - eval_y) ** 2)
+                gm = jnp.mean(jnp.sum((gp - eval_g) ** 2, axis=1))
+                selection_obj = vm + grad_weight * gm
 
                 if float(selection_obj) < best_val:
                     best_val = float(selection_obj)
                     best_params = _copy_params(params)
-                print(log_message)
+                print(
+                    f"Epoch {epoch:4d} | {metric_label} value MSE: {vm:.4e} "
+                    f"| {metric_label} grad MSE: {gm:.4e}"
+                )
 
     return best_params
 
