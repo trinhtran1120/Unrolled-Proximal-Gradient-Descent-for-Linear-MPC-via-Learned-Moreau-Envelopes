@@ -18,10 +18,10 @@ struct LinearMPC
     R::Matrix{Float64}
 
     x0::Vector{Float64}
-    xmin::Int
-    xmax::Int
-    umin::Int
-    umax::Int
+    xmin::Float64
+    xmax::Float64
+    umin::Float64
+    umax::Float64
 
     nx::Int
     nu::Int
