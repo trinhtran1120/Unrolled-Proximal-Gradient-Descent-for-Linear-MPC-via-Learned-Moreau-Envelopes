@@ -2,6 +2,7 @@ include("matrix_tools.jl")
 
 using Base.Threads
 using JSON3
+using LinearAlgebra
 using SparseArrays
 
 struct LearnedICNN
@@ -12,9 +13,13 @@ struct LearnedICNN
     a::Vector{Float64}
     c::Float64
     rho::Float64
+    input_mean::Vector{Float64}
+    input_std::Vector{Float64}
+    env_scale::Float64
 end
 
 softplus(x) = log1p(exp(-abs(x))) + max(x, zero(x))
+sigmoid(x) = x >= 0 ? inv(1 + exp(-x)) : exp(x) / (1 + exp(x))
 
 function json_matrix(value)
     return Float64.(reduce(hcat, value)')
@@ -26,6 +31,18 @@ end
 
 function load_learned_icnn(path::AbstractString)
     data = JSON3.read(read(path, String))
+    input_dim = length(data["a"])
+
+    if haskey(data, :normalization)
+        normalization = data["normalization"]
+        input_mean = json_vector(normalization["input_mean"])
+        input_std = json_vector(normalization["input_std"])
+        env_scale = Float64(normalization["env_scale"])
+    else
+        input_mean = zeros(Float64, input_dim)
+        input_std = ones(Float64, input_dim)
+        env_scale = 1.0
+    end
 
     return LearnedICNN(
         [json_matrix(layer) for layer in data["U"]],
@@ -35,22 +52,35 @@ function load_learned_icnn(path::AbstractString)
         json_vector(data["a"]),
         Float64(data["c"]),
         Float64(data["rho"]),
+        input_mean,
+        input_std,
+        env_scale,
     )
 end
 
 function moreau_envelope(model::LearnedICNN, input::AbstractVector)
-    z = softplus.(model.U[1] * input .+ model.b[1])
+    normalized_input = (input .- model.input_mean) ./ model.input_std
+    z = softplus.(model.U[1] * normalized_input .+ model.b[1])
 
     for layer_index in 2:length(model.U)
         z = softplus.(
             model.W[layer_index] * z .+
-            model.U[layer_index] * input .+
+            model.U[layer_index] * normalized_input .+
             model.b[layer_index]
         )
     end
 
-    raw_output = dot(model.v, z) + dot(model.a, input) + model.c
-    return softplus(raw_output)
+    raw_output = dot(model.v, z) + dot(model.a, normalized_input) + model.c
+    return model.env_scale * softplus(raw_output)
+end
+
+function icnn_from_learned(model::LearnedICNN)
+    layers = [
+        ICNN_Layer(model.U[layer_index], model.W[layer_index], model.b[layer_index])
+        for layer_index in 2:length(model.U)
+    ]
+
+    return ICNN(model.U[1], model.b[1], layers, model.v, model.a, model.c)
 end
 
 function load_model(fname::String)
@@ -99,8 +129,7 @@ end
     for layer in m.layers
         z, _ = layer(x, z)
     end
-    f = @. m.v'*z + m.a'*x + m.c
-    return f
+    return m.v' * z .+ m.a' * x .+ m.c
 end
 
 mutable struct gradient_struct
@@ -141,16 +170,25 @@ end
 precompile(gradient_struct, (ICNN, Int, Int))
 
 
-@inbounds function mini_batch(local_gradients::NTuple, batch::AbstractMatrix)
+@inbounds function mini_batch(
+    local_gradients::NTuple,
+    batch::AbstractMatrix;
+    batch_size::Int = size(batch, 2),
+)
     data_size = size(batch, 2)
-    n_mb      = div(data_size -1, s_mb) + 1
+    n_mb      = div(data_size - 1, batch_size) + 1
+
+    if length(local_gradients) < n_mb
+        throw(ArgumentError("local_gradients must contain at least $n_mb gradient evaluators"))
+    end
+
     out       = copy(batch)
 
     @threads for i in 1:n_mb
         if i == n_mb
-            @views out[:, (data_size - s_mb + 1):data_size] .= local_gradients[i](batch[:, (data_size - s_mb + 1):data_size])
+            @views out[:, (data_size - batch_size + 1):data_size] .= local_gradients[i](batch[:, (data_size - batch_size + 1):data_size])
         else
-            @views out[:,(i-1)*s_mb+1:i*s_mb] .= local_gradients[i](batch[:,(i-1)*s_mb+1:i*s_mb])
+            @views out[:, (i - 1) * batch_size + 1:i * batch_size] .= local_gradients[i](batch[:, (i - 1) * batch_size + 1:i * batch_size])
         end
     end
     return out

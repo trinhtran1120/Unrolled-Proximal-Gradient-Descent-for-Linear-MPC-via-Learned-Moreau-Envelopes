@@ -20,12 +20,12 @@ TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.001-train.npz"
 TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.001-test.npz"
 MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.001"
 
-WIDTHS = [64, 64]
+WIDTHS = [16, 16]
 LEARNING_RATE = 1e-3
 GRAD_WEIGHT = 5.0
 L2_REG = 0.0
 BATCH_SIZE = 32
-EPOCHS = 5000
+EPOCHS = 2000
 SEED = 0
 NORMALIZATION_EPS = 1e-8
 
@@ -87,6 +87,16 @@ def apply_normalization(
     return X_norm, y_norm, g_norm
 
 
+def evaluate_normalized(params, Xva, yva, gva):
+    """Compute value and gradient MSEs in normalized training units."""
+    y_pred = batched_forward(params, jnp.asarray(Xva))
+    g_pred = batched_grad_wrt_x(params, jnp.asarray(Xva))[:, : gva.shape[1]]
+
+    val_mse = jnp.mean((y_pred - jnp.asarray(yva)) ** 2)
+    grad_mse = jnp.mean(jnp.sum((g_pred - jnp.asarray(gva)) ** 2, axis=1))
+    return val_mse, grad_mse
+
+
 def evaluate(params, Xva, yva, gva, normalization):
     """Compute held-out value and gradient MSEs in original MPC units."""
     Xva_norm, _, _ = apply_normalization(Xva, yva, gva, normalization)
@@ -140,6 +150,7 @@ if __name__ == "__main__":
 
     normalization = fit_normalization(Xtr, ytr)
     Xtr_norm, ytr_norm, gtr_norm = apply_normalization(Xtr, ytr, gtr, normalization)
+    Xva_norm, yva_norm, gva_norm = apply_normalization(Xva, yva, gva, normalization)
 
     params = train_icnn(
         Xtr_norm,
@@ -153,9 +164,17 @@ if __name__ == "__main__":
         batch_size=BATCH_SIZE,
         epochs=EPOCHS,
         seed=SEED,
+        X_val=Xva_norm,
+        y_val=yva_norm,
+        g_val=gva_norm,
     )
 
+    norm_val_mse, norm_grad_mse = evaluate_normalized(params, Xva_norm, yva_norm, gva_norm)
     val_mse, grad_mse = evaluate(params, Xva, yva, gva, normalization)
-    print(f"[TEST] value MSE: {val_mse:.4e} | grad MSE: {grad_mse:.4e}")
+    print(
+        f"[TEST normalized] value MSE: {norm_val_mse:.4e} "
+        f"| grad MSE: {norm_grad_mse:.4e}"
+    )
+    print(f"[TEST original] value MSE: {val_mse:.4e} | grad MSE: {grad_mse:.4e}")
 
     save_model(prepare_for_export(params, rho, normalization), MODEL_PATH)

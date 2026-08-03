@@ -26,17 +26,14 @@ function learned_PGM(
 )
     U = zeros(Float64, system.nu, system.N)
     objective_history = Float64[]
-    gradient_time_history = Float64[]
+    start_time = time()
 
     for iter in 1:max_iter
         cost, grad = grad_cost(system, x0, U)
         push!(objective_history, cost)
 
         W = U - rho * grad
-        gradient_start = time_ns()
         learned_grad = learned_moreau_gradient(model, system, W, x0)
-        gradient_time = (time_ns() - gradient_start) / 1e9
-        push!(gradient_time_history, gradient_time)
         U_next = W - rho * learned_grad
 
         step_norm = norm(U_next - U)
@@ -49,13 +46,13 @@ function learned_PGM(
             break
         end
     end
+    solve_time = time() - start_time
 
     return (
         U = U,
         X = rollout(system, x0, U),
         objective_history = objective_history,
-        gradient_time_history = gradient_time_history,
-        total_gradient_time = sum(gradient_time_history),
+        solve_time = solve_time,
     )
 end
 

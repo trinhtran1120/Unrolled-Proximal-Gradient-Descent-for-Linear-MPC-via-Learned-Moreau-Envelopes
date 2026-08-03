@@ -9,8 +9,8 @@ end
 @inline function activation_sigma!(activ, sigma_buf, preactiv)
     @inbounds @simd for i in eachindex(activ)
         val          = preactiv[i]
-        activ[i]     = NNlib.softplus(val)
-        sigma_buf[i] = NNlib.σ(val)
+        activ[i]     = softplus(val)
+        sigma_buf[i] = sigmoid(val)
     end
     return activ
 end

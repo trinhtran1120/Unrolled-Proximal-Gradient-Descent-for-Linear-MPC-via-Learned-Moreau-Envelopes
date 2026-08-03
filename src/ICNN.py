@@ -208,6 +208,9 @@ def train_icnn(
     batch_size: int = 128,
     epochs: int = 200,
     seed: int = 0,
+    X_val: np.ndarray | None = None,
+    y_val: np.ndarray | None = None,
+    g_val: np.ndarray | None = None,
 ) -> Params:
     """Train an ICNN with value and input-gradient supervision."""
     if epochs < 0:
@@ -216,6 +219,11 @@ def train_icnn(
     key = jax.random.PRNGKey(seed)
     widths = _validate_widths(widths)
     Xj, yj, gj = _as_training_arrays(X, y, g, n_in)
+    has_validation = X_val is not None or y_val is not None or g_val is not None
+    if has_validation:
+        if X_val is None or y_val is None or g_val is None:
+            raise ValueError("X_val, y_val, and g_val must be provided together")
+        Xvj, yvj, gvj = _as_training_arrays(X_val, y_val, g_val, n_in)
 
     params = init_icnn_params(key, n_in=n_in, widths=widths)
     best_params = params
@@ -238,11 +246,27 @@ def train_icnn(
                 gp = batched_grad_wrt_x(params, Xj[:1024])[:, : gj.shape[1]]
                 vm = jnp.mean((yp - yj[:1024]) ** 2)
                 gm = jnp.mean(jnp.sum((gp - gj[:1024]) ** 2, axis=1))
-                val_obj = vm + grad_weight * gm
-                if float(val_obj) < best_val:
-                    best_val = float(val_obj)
+                selection_obj = vm + grad_weight * gm
+                log_message = (
+                    f"Epoch {epoch:4d} | train value MSE: {vm:.4e} "
+                    f"| train grad MSE: {gm:.4e}"
+                )
+
+                if has_validation:
+                    yvp = batched_forward(params, Xvj)
+                    gvp = batched_grad_wrt_x(params, Xvj)[:, : gvj.shape[1]]
+                    vvm = jnp.mean((yvp - yvj) ** 2)
+                    vgm = jnp.mean(jnp.sum((gvp - gvj) ** 2, axis=1))
+                    selection_obj = vvm + grad_weight * vgm
+                    log_message = (
+                        f"{log_message} | val value MSE: {vvm:.4e} "
+                        f"| val grad MSE: {vgm:.4e}"
+                    )
+
+                if float(selection_obj) < best_val:
+                    best_val = float(selection_obj)
                     best_params = _copy_params(params)
-                print(f"Epoch {epoch:4d} | val MSE: {vm:.4e} | grad MSE: {gm:.4e}")
+                print(log_message)
 
     return best_params
 
