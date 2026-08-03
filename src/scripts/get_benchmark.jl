@@ -20,7 +20,7 @@ include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
 const SOLVER_NAME = "OSQP"
 const TOL = 1e-3
-const PGM_RHO = 0.001
+const PGM_RHO = 0.005
 const PGM_MAX_ITER = 1000
 const LEARNED_PGM_MAX_ITER = 1000
 const BENCHMARK_SAMPLES = 10
@@ -47,7 +47,6 @@ opt_X, opt_U, solver_time, J_opt = solve_mpc(x0; verbose = true)
 @printf("solve time = %8.3f ms\n\n", solver_time * 1000)
 
 println("---------------- exact PGM ----------------")
-pgm_start = time()
 pgm_sol = PGM(
     mpc_data,
     x0;
@@ -56,10 +55,9 @@ pgm_sol = PGM(
     tol = TOL,
     verbose = true,
 )
-pgm_time = time() - pgm_start
 J_pgm, _ = grad_cost(mpc_data, x0, pgm_sol.U)
 @printf("objective = %10.6f\n", J_pgm)
-# @printf("solve time = %8.3f ms\n", pgm_time * 1000)
+# @printf("solve time = %8.3f ms\n", pgm_sol.solve_time * 1000)
 @printf("iterations = %d\n", length(pgm_sol.objective_history))
 @printf("relative objective gap = %8.4f%%\n", abs(J_opt - J_pgm) / abs(J_opt) * 100)
 @printf("max |solver U - PGM U| = %8.4e\n", maximum(abs.(opt_U - pgm_sol.U)))
@@ -71,6 +69,7 @@ learned_sol = learned_PGM(
     mpc_data;
     x0 = x0,
     rho = learned_model.rho,
+    # rho = 0.,
     max_iter = LEARNED_PGM_MAX_ITER,
     tol = TOL,
     verbose = true,
@@ -91,15 +90,14 @@ learned_pgm_times = zeros(Float64, BENCHMARK_SAMPLES)
 for sample in 1:BENCHMARK_SAMPLES
     _, _, solver_times[sample], _ = solve_mpc(x0)
 
-    start_time = time()
-    PGM(
+    pgm_result = PGM(
         mpc_data,
         x0;
         rho = PGM_RHO,
         max_iter = PGM_MAX_ITER,
         tol = TOL,
     )
-    pgm_times[sample] = time() - start_time
+    pgm_times[sample] = pgm_result.solve_time
 
     learned_result = learned_PGM(
         learned_model,

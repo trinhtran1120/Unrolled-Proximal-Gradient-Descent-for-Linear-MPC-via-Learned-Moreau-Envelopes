@@ -30,6 +30,7 @@ function learned_PGM(
     objective_history = Float64[]
     gradient_model = icnn_from_learned(model)
     local_gradients = (gradient_struct(gradient_model, 1, length(model.a)),)
+    project = projection(system, x0, U)
     start_time = time()
     solve_time = 0.0
 
@@ -40,11 +41,11 @@ function learned_PGM(
         @. W = U - rho * grad
         learned_grad = learned_moreau_gradient(model, local_gradients, system, W, x0)
         @. U_next = W - rho * learned_grad
-        solve_time = time() - start_time
+        copyto!(U_next, project(x0, U_next))
 
         residual = norm(U_next - U)
         copyto!(U, U_next)
-        
+        solve_time = time() - start_time
 
         if residual <= tol
             if verbose
@@ -53,6 +54,9 @@ function learned_PGM(
             break
         end
     end
+
+    copyto!(U, project(x0, U))
+    solve_time = time() - start_time
 
     return (
         U = U,

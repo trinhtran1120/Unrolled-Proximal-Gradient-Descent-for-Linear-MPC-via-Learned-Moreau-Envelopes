@@ -117,6 +117,8 @@ function PGM(
     W_data = Vector{Vector{Float64}}()
     ME_data = Float64[]
     ME_grad_data = Vector{Vector{Float64}}()
+    start_time = time()
+    solve_time = 0.0
 
     for iter in 1:max_iter
         cost, grad = grad_cost(problem, x0, U)
@@ -134,6 +136,7 @@ function PGM(
 
         residual = norm(U_next - U)
         U .= U_next
+        solve_time = time() - start_time
 
         if residual <= tol
             if verbose
@@ -150,5 +153,6 @@ function PGM(
         W_data = W_data,
         ME_data = ME_data,
         ME_grad_data = ME_grad_data,
+        solve_time = solve_time,
     )
 end
