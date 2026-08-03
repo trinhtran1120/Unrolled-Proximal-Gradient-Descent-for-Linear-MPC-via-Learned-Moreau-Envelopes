@@ -90,7 +90,7 @@ train_data = Dict(
     "nu" => mpc_data.nu,
 )
 npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)-train.npz"),
+    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train.npz"),
     train_data,
 )
 
@@ -126,6 +126,6 @@ test_data = Dict(
     "nu" => mpc_data.nu,
 )
 npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)-test.npz"),
+    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test.npz"),
     test_data,
 )
