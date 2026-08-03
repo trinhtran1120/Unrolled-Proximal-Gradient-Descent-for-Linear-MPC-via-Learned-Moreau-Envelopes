@@ -23,6 +23,7 @@ struct LinearMPC
     R::Matrix{Float64}
 
     x0::Vector{Float64}
+    xr::Vector{Float64}
     # xmin::Float64
     # xmax::Float64
     # umin::Float64
@@ -53,6 +54,7 @@ function mpc_problem()
 
     # nx = size(A, 1)
     # nu = size(B, 2)
+
     # Discrete time model of a quadcopter
     A = [1       0       0   0   0   0   0.1     0       0    0       0       0;
         0       1       0   0   0   0   0       0.1     0    0       0       0;
@@ -79,6 +81,7 @@ function mpc_problem()
         0.0236  0      -0.0236  0;
         0.2107  0.2107  0.2107  0.2107] |> sparse
     (nx, nu) = size(B)
+
     # Constraints
     u0 = 10.5916
     umin = [9.6, 9.6, 9.6, 9.6] .- u0
@@ -105,6 +108,7 @@ function mpc_problem()
         Q,
         R,
         x0,
+        xr,
         xmin,
         xmax,
         umin,

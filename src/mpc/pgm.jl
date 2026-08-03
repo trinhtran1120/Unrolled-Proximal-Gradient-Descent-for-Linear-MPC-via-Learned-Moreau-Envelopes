@@ -58,7 +58,7 @@ function grad_cost(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
         uk = U[:, k]
 
         grad[:, k] .= problem.R * uk + problem.B' * p_next
-        p_next .= problem.Q * xk + problem.A' * p_next
+        p_next .= problem.Q * (xk - problem.xr) + problem.A' * p_next
     end
 
     return cost, grad
@@ -76,10 +76,10 @@ function projection(
 
     A_ss, B_ss, _ = converted_matrices(problem)
 
-    x_lower = fill(problem.xmin, nx * N) .- A_ss * x0_init
-    x_upper = fill(problem.xmax, nx * N) .- A_ss * x0_init
-    u_lower = fill(problem.umin, nu * N)
-    u_upper = fill(problem.umax, nu * N)
+    x_lower = repeat(problem.xmin, N) .- (A_ss * x0_init)
+    x_upper = repeat(problem.xmax, N) .- (A_ss * x0_init)
+    u_lower = repeat(problem.umin, N)
+    u_upper = repeat(problem.umax, N)
 
     feasible_set = IndPolyhedral(
         x_lower,

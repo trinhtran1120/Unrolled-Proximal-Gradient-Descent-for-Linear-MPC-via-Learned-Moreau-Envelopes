@@ -21,8 +21,8 @@ function mpc_solver(name, problem, tol)
     N = problem.N
     cost_func = problem.cost_func
     
-    @variable(model, xmin .<= x[1:nx, 1:N+1] .<= xmax)
-    @variable(model, umin .<= u[1:nu, 1:N] .<= umax)
+    @variable(model, xmin[i] <= x[i = 1:nx, j = 1:(N + 1)] <= xmax[i])
+    @variable(model, umin[i] <= u[i = 1:nu, j = 1:N] <= umax[i])
 
     @variable(model, x0[i in 1:nx] in MOI.Parameter(x0_init[i]))
 

@@ -3,6 +3,35 @@ using LinearAlgebra
 include("pgm.jl")
 include(joinpath(@__DIR__, "..", "utils", "utils.jl"))
 
+function learned_input_dim(system::LinearMPC)
+    return system.nu * system.N + system.nx
+end
+
+function validate_learned_pgm_dimensions(
+    model::LearnedICNN,
+    system::LinearMPC,
+    W::Matrix{Float64},
+    x0::Vector{Float64},
+)
+    expected_u_size = (system.nu, system.N)
+    if size(W) != expected_u_size
+        throw(DimensionMismatch("W must have size $expected_u_size, got $(size(W))"))
+    end
+
+    if length(x0) != system.nx
+        throw(DimensionMismatch("x0 must have length $(system.nx), got $(length(x0))"))
+    end
+
+    expected_input_dim = learned_input_dim(system)
+    model_input_dim = length(model.a)
+    if model_input_dim != expected_input_dim
+        throw(DimensionMismatch(
+            "learned ICNN input dimension must be $expected_input_dim " *
+            "(nu*N + nx = $(system.nu)*$(system.N) + $(system.nx)), got $model_input_dim",
+        ))
+    end
+end
+
 function learned_moreau_gradient(
     model::LearnedICNN,
     local_gradients::NTuple,
@@ -10,9 +39,12 @@ function learned_moreau_gradient(
     W::Matrix{Float64},
     x0::Vector{Float64},
 )
+    validate_learned_pgm_dimensions(model, system, W, x0)
+
+    control_dim = system.nu * system.N
     input = vcat(vec(W), x0)
     full_gradient = learned_moreau_full_gradient(model, local_gradients, input)
-    return reshape(full_gradient[1:(system.nu * system.N)], system.nu, system.N)
+    return reshape(full_gradient[1:control_dim], system.nu, system.N)
 end
 
 function learned_PGM(
@@ -24,6 +56,8 @@ function learned_PGM(
     tol::Float64 = 1e-6,
     verbose = false,
 )
+    validate_learned_pgm_dimensions(model, system, zeros(Float64, system.nu, system.N), x0)
+
     U = zeros(Float64, system.nu, system.N)
     W = similar(U)
     U_next = similar(U)

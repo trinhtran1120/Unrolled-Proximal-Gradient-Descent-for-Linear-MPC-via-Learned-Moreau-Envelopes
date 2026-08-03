@@ -19,8 +19,13 @@ include("../src/mpc/solver.jl")
         @test X[:, k+1] ≈ problem.A * X[:, k] + problem.B * U[:, k] atol=1e-5
     end
 
-    @test all(problem.xmin .<= X)
-    @test all(X .<= problem.xmax)
-    @test all(problem.umin .- 1e-5 .<= U)
-    @test all(U .<= problem.umax .+ 1e-5)
+    for k in 1:(problem.N + 1)
+        @test all(problem.xmin .- 1e-5 .<= X[:, k])
+        @test all(X[:, k] .<= problem.xmax .+ 1e-5)
+    end
+
+    for k in 1:problem.N
+        @test all(problem.umin .- 1e-5 .<= U[:, k])
+        @test all(U[:, k] .<= problem.umax .+ 1e-5)
+    end
 end
