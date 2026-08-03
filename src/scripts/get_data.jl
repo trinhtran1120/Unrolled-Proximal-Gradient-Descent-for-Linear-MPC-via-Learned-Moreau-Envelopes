@@ -17,7 +17,7 @@ include(joinpath(@__DIR__, "..", "mpc", "pgm.jl"))
 const DATASET_DIR = joinpath(@__DIR__, "..", "..", "data")
 mkpath(DATASET_DIR)
 
-solver_name = "Ipopt"
+solver_name = "OSQP"
 tol = 5e-4
 pgm_rho = 0.001
 pgm_max_iter = 1000

@@ -20,7 +20,7 @@ include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
 const SOLVER_NAME = "OSQP"
 const TOL = 1e-3
-const PGM_RHO = 0.005
+const PGM_RHO = 0.05
 const PGM_MAX_ITER = 1000
 const LEARNED_PGM_MAX_ITER = 1000
 const BENCHMARK_SAMPLES = 10
@@ -42,7 +42,7 @@ println("learned model = $model_path")
 println()
 
 println("---------------- $SOLVER_NAME ----------------")
-opt_X, opt_U, solver_time, J_opt = solve_mpc(x0; verbose = true)
+opt_X, opt_U, solver_time, J_opt = solve_mpc(x0; verbose = false)
 @printf("objective = %10.6f\n", J_opt)
 @printf("solve time = %8.3f ms\n\n", solver_time * 1000)
 

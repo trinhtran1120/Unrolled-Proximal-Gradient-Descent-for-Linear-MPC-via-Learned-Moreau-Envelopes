@@ -14,7 +14,9 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     )
     learned_model = load_learned_icnn(model_path)
 
-    @test length(learned_model.a) == problem.nu * problem.N + problem.nx
+    expected_input_dim = problem.nu * problem.N + problem.nx
+    @test learned_input_dim(problem) == expected_input_dim
+    @test length(learned_model.a) == expected_input_dim
 
     U = zeros(problem.nu, problem.N)
     W = U
@@ -31,6 +33,20 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
 
     @test size(learned_grad) == size(U)
     @test all(isfinite, learned_grad)
+    @test_throws DimensionMismatch learned_moreau_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        zeros(problem.nu, problem.N + 1),
+        problem.x0,
+    )
+    @test_throws DimensionMismatch learned_moreau_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        W,
+        [problem.x0; 0.0],
+    )
 
     result = learned_PGM(
         learned_model,
