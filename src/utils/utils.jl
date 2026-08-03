@@ -1,4 +1,4 @@
-include("matrix_tools.jl")
+include(joinpath(@__DIR__, "matrix_tools.jl"))
 
 using Base.Threads
 using JSON3
@@ -73,6 +73,25 @@ function moreau_envelope(model::LearnedICNN, input::AbstractVector)
     raw_output = dot(model.v, z) + dot(model.a, normalized_input) + model.c
     return model.env_scale * softplus(raw_output)
 end
+
+function learned_moreau_full_gradient(
+    model::LearnedICNN,
+    local_gradients::NTuple,
+    input::AbstractVector,
+)
+    normalized_input = (input .- model.input_mean) ./ model.input_std
+    input_batch = reshape(normalized_input, :, 1)
+
+    raw_output = local_gradients[1].m(input_batch)
+    raw_gradient = mini_batch(local_gradients, input_batch; batch_size = 1)
+    full_gradient = vec(
+        model.env_scale .* sigmoid.(raw_output) .* raw_gradient ./
+        reshape(model.input_std, :, 1)
+    )
+
+    return full_gradient
+end
+
 
 function icnn_from_learned(model::LearnedICNN)
     layers = [
@@ -185,11 +204,9 @@ precompile(gradient_struct, (ICNN, Int, Int))
     out       = copy(batch)
 
     @threads for i in 1:n_mb
-        if i == n_mb
-            @views out[:, (data_size - batch_size + 1):data_size] .= local_gradients[i](batch[:, (data_size - batch_size + 1):data_size])
-        else
-            @views out[:, (i - 1) * batch_size + 1:i * batch_size] .= local_gradients[i](batch[:, (i - 1) * batch_size + 1:i * batch_size])
-        end
+        col_start = (i - 1) * batch_size + 1
+        col_stop = min(i * batch_size, data_size)
+        @views out[:, col_start:col_stop] .= local_gradients[i](batch[:, col_start:col_stop])
     end
     return out
 end

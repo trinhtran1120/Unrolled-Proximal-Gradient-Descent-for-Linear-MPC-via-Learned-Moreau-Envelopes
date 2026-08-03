@@ -22,6 +22,7 @@ function pick_solver(name, tol::Float64 = 1e-6)
         model = Model(OSQP.Optimizer); 
         set_optimizer_attribute(model, "eps_abs", tol); 
         set_optimizer_attribute(model, "eps_rel", tol)
+        set_optimizer_attribute(model, "warm_start", true)
 
     elseif str == "clarabel" #for NLP
         model = Model(Clarabel.Optimizer)
