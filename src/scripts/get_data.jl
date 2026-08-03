@@ -54,7 +54,7 @@ for x0 in train_pool
     println("================ Collecting training data with initial state = $x0 ================")
     println("---------------- $solver_name ----------------")
 
-    opt_X, opt_U, J_opt = solve_mpc(x0)
+    opt_X, opt_U, _solver_time, J_opt = solve_mpc(x0)
     @printf("J_opt = %8.4f\n", J_opt)
 
     println("---------------- PGM ----------------")

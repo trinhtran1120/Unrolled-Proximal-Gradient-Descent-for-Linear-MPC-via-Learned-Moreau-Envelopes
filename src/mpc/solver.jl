@@ -34,15 +34,21 @@ function mpc_solver(name, problem, tol)
 
     J = @expression(model, sum(cost_func(x[:,k], u[:, k]) for k in 1:N))
     @objective(model, Min, J)
-    optimize!(model)
 
     function solver(init::Vector{Float64}; verbose=false)
         set_parameter_value.(x0, init)
         optimize!(model)
+
         if verbose
             println(solution_summary(model))
         end
-        return value.(x), value.(u), objective_value(model)
+
+        # status = termination_status(model)
+        # if !(status in (MOI.OPTIMAL, MOI.LOCALLY_SOLVED))
+        #     error("MPC solve failed with status: $status")
+        # end
+
+        return value.(x), value.(u), solve_time(model), objective_value(model)
     end
 
     return solver

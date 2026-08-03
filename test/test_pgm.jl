@@ -49,7 +49,7 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "solver.jl"))
 
 
     solve = mpc_solver("Ipopt", problem, 1e-6)
-    X_opt, U_opt, J_opt = solve(problem.x0)
+    X_opt, U_opt, _solve_time, J_opt = solve(problem.x0)
 
     result = PGM(problem, problem.x0; rho=0.001, max_iter=1000, tol=5e-4)
     J_pgm, _ = grad_cost(problem, problem.x0, result.U)

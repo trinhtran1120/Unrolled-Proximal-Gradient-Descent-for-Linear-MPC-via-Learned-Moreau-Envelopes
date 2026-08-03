@@ -23,7 +23,7 @@ const TOL = 1e-3
 const PGM_RHO = 0.001
 const PGM_MAX_ITER = 1000
 const LEARNED_PGM_MAX_ITER = 1000
-const BENCHMARK_SAMPLES = 20
+const BENCHMARK_SAMPLES = 10
 
 model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-icnn-rho=0.json")
 
@@ -42,11 +42,9 @@ println("learned model = $model_path")
 println()
 
 println("---------------- $SOLVER_NAME ----------------")
-solver_start = time()
-opt_X, opt_U, J_opt = solve_mpc(x0; verbose = true)
-solver_time = time() - solver_start
+opt_X, opt_U, solver_time, J_opt = solve_mpc(x0; verbose = true)
 @printf("objective = %10.6f\n", J_opt)
-# @printf("solve time = %8.3f ms\n\n", solver_time * 1000)
+@printf("solve time = %8.3f ms\n\n", solver_time * 1000)
 
 println("---------------- exact PGM ----------------")
 pgm_start = time()
@@ -91,9 +89,7 @@ pgm_times = zeros(Float64, BENCHMARK_SAMPLES)
 learned_pgm_times = zeros(Float64, BENCHMARK_SAMPLES)
 
 for sample in 1:BENCHMARK_SAMPLES
-    start_time = time()
-    solve_mpc(x0)
-    solver_times[sample] = time() - start_time
+    _, _, solver_times[sample], _ = solve_mpc(x0)
 
     start_time = time()
     PGM(
