@@ -32,7 +32,7 @@ NORMALIZATION_EPS = 1e-8
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
-from ICNN import (
+from learning.ICNN import (
     act_p,
     batched_forward,
     batched_grad_wrt_x,
