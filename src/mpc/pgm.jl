@@ -5,13 +5,6 @@ using ProximalOperators
 
 include("problem.jl")
 
-function ProximalAlgorithms.value_and_gradient(
-    f::ProximalOperators.Quadratic,
-    x::AbstractVector,
-)
-    grad, value = ProximalOperators.gradient(f, x)
-    return value, grad
-end
 
 function rollout(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
     nx = problem.nx
@@ -54,27 +47,6 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
     return ProximalOperators.Quadratic(H, h)
 end
 
-function grad_cost(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
-    nx = problem.nx
-    nu = problem.nu
-    N = problem.N
-
-    X = rollout(problem, x0, U)
-    cost = sum(problem.cost_func(X[:, k], U[:, k]) for k in 1:N)
-
-    grad = zeros(Float64, nu, N)
-    p_next = zeros(Float64, nx)
-
-    for k in N:-1:1
-        xk = X[:, k]
-        uk = U[:, k]
-
-        grad[:, k] .= problem.R * uk + problem.B' * p_next
-        p_next .= problem.Q * xk + problem.A' * p_next
-    end
-
-    return cost, grad
-end
 
 function constraint(problem::LinearMPC, x0::Vector{Float64}; solver=:osqp)
     A_ro = problem.A_ro
@@ -103,20 +75,6 @@ function constraint(problem::LinearMPC, x0::Vector{Float64}; solver=:osqp)
     )
 end
 
-function projection(
-    problem::LinearMPC,
-    x0::Vector{Float64},
-    W_init::Matrix{Float64},
-)
-    feasible_set = constraint(problem, x0; solver = :osqp)
-
-    function solver(init::Vector{Float64}, W_value::Matrix{Float64}; verbose=false)
-        projected_u, _ = prox(feasible_set, vec(W_value))
-        return reshape(projected_u, problem.nu, problem.N)
-    end
-
-    return solver
-end
 
 function PGM_solver(
     problem::LinearMPC;

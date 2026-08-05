@@ -32,18 +32,8 @@ solve_pgm = PGM_solver(
 )
 cost_func = mpc_data.cost_func
 
-data_train = Dict(
-    "input" => Vector{Float64}[],
-    "env" => Float64[],
-    "grad" => Vector{Float64}[],
-    "gamma" => Float64[],
-)
-data_test = Dict(
-    "input" => Vector{Float64}[],
-    "env" => Float64[],
-    "grad" => Vector{Float64}[],
-    "gamma" => Float64[],
-)
+data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
+data_test = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
 
 train_pool = [
     [3.0, 1.0],
@@ -73,7 +63,7 @@ for x0 in train_pool
     @printf("J_opt = %8.4f\n", J_opt)
 
     println("---------------- PGM ----------------")
-    pgm_U, pgm_X, _pgm_objective = solve_pgm(
+    pgm_U, pgm_X, _ = solve_pgm(
         x0;
         data = data_train,
         verbose = true,
@@ -101,10 +91,12 @@ npzwrite(
     train_data,
 )
 
+
+
 for x0 in test_pool
     println("================ Collecting testing data with initial state = $x0 ================")
 
-    pgm_U, pgm_X, _pgm_objective = solve_pgm(
+    pgm_U, pgm_X, _ = solve_pgm(
         x0;
         data = data_test,
         verbose = true,
@@ -113,18 +105,18 @@ for x0 in test_pool
     @printf("J_PGM = %8.4f\n", J_PGM)
 end
 
-# @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
-# test_data = Dict(
-#     "input" => reduce(hcat, data_test["input"]),
-#     "grad" => reduce(hcat, data_test["grad"]),
-#     "rho_initial" => pgm_rho,
-#     "gamma" => data_test["gamma"],
-#     "env" => data_test["env"],
-#     "N" => mpc_data.N,
-#     "nx" => mpc_data.nx,
-#     "nu" => mpc_data.nu,
-# )
-# npzwrite(
-#     joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test.npz"),
-#     test_data,
-# )
+@printf("Collected %4d testing data points\n\n", length(data_test["input"]))
+test_data = Dict(
+    "input" => reduce(hcat, data_test["input"]),
+    "grad" => reduce(hcat, data_test["grad"]),
+    "rho_initial" => pgm_rho,
+    "gamma" => data_test["gamma"],
+    "env" => data_test["env"],
+    "N" => mpc_data.N,
+    "nx" => mpc_data.nx,
+    "nu" => mpc_data.nu,
+)
+npzwrite(
+    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test.npz"),
+    test_data,
+)
