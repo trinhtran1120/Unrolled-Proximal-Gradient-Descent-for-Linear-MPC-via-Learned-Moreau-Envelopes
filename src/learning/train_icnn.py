@@ -16,11 +16,11 @@ PROJECT_DIR = SCRIPT_DIR.parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 MODEL_DIR = PROJECT_DIR / "model"
 
-TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.001-train.npz"
-TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.001-test.npz"
-MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.001"
+TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-train.npz"
+TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-test.npz"
+MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.1-gamma"
 
-WIDTHS = [32, 32]
+WIDTHS = [16, 16]
 LEARNING_RATE = 1e-3
 GRAD_WEIGHT = 10.0
 L2_REG = 0.0
@@ -44,11 +44,29 @@ from icnn import (
 def load_dataset(path: Path):
     """Load a linear-MPC Moreau-envelope dataset in learner-friendly orientation."""
     with np.load(path) as data:
+        X = data["input"].T
+        y = data["env"]
+        g = data["grad"].T
+
+        if "gamma" not in data:
+            raise KeyError(
+                f"{path} does not contain gamma; regenerate the dataset with "
+                "adaptive PGM logging before training this model."
+            )
+
+        gamma = np.asarray(data["gamma"]).reshape(-1, 1)
+        if gamma.shape[0] != X.shape[0]:
+            raise ValueError(
+                "gamma must contain one value per sample: "
+                f"got {gamma.shape[0]} gamma values for {X.shape[0]} samples"
+            )
+
+        rho_key = "rho_initial" if "rho_initial" in data else "rho"
         return (
-            data["input"].T,
-            data["env"],
-            data["grad"].T,
-            float(data["rho"]),
+            np.hstack([X, gamma]),
+            y,
+            g,
+            float(data[rho_key]),
         )
 
 
