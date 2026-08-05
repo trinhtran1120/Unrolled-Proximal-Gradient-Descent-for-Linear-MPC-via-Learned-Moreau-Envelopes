@@ -6,16 +6,16 @@ using ProximalOperators
 include("problem.jl")
 
 
-struct GetGrad
+struct DifferentiableQuadratic
     H::Matrix{Float64}
     h::Vector{Float64}
 end
 
-function (f::GetGrad)(u)
+function (f::DifferentiableQuadratic)(u)
     return 0.5 * dot(u, f.H * u) + dot(f.h, u)
 end
 
-function value_and_gradient(f::GetGrad, u)
+function ProximalAlgorithms.value_and_gradient(f::DifferentiableQuadratic, u)
     grad = f.H * u + f.h
     return f(u), grad
 end
@@ -59,7 +59,7 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
         H[u_idx, u_idx] .+= R
     end
 
-    return GetGrad(H, h)
+    return DifferentiableQuadratic(H, h)
 end
 
 function constraint(problem::LinearMPC, x0::Vector{Float64}; solver=:osqp)
