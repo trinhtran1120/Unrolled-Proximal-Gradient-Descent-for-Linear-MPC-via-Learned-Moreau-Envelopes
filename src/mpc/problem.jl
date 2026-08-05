@@ -58,7 +58,6 @@ struct LinearMPC
 end
 
 
-
 function mpc_problem()
     A = [2.0 -1.0; 1.0 0.2]
     B = [1.0; 0.0;;]

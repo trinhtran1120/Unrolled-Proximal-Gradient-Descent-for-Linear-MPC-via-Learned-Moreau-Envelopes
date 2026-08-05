@@ -1,4 +1,6 @@
 using LinearAlgebra
+using Zygote
+using DifferentiationInterface: AutoZygote
 using ProximalAlgorithms
 using ProximalCore
 using ProximalOperators
@@ -44,7 +46,10 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
         H[u_idx, u_idx] .+= R
     end
 
-    return ProximalOperators.Quadratic(H, h)
+    return ProximalAlgorithms.AutoDifferentiable(
+        u -> 0.5 * dot(u, H * u) + dot(h, u),
+        AutoZygote(),
+    )
 end
 
 
@@ -86,11 +91,11 @@ function PGM_solver(
     N = problem.N
     u0 = zeros(Float64, nu * N)
     u_solution = copy(u0)
-    objective = 0.0
 
     return @inbounds function solver(x0::Vector{Float64}; data = nothing, verbose = false)
     f = single_shooting_cost(problem, x0)
     g = constraint(problem, x0; solver = :osqp)
+
     ffb_iter = ProximalAlgorithms.FastForwardBackwardIteration(
         f = f,
         g = g,
@@ -104,8 +109,6 @@ function PGM_solver(
 
         for (iter, state) in enumerate(ffb_iter)
             u_solution .= state.z
-
-            objective = f(state.z)
 
             moreau = ProximalOperators.MoreauEnvelope(g, state.gamma)
             moreau_grad = similar(state.y)
@@ -137,6 +140,7 @@ function PGM_solver(
 
         U = reshape(u_solution, nu, N)
         X = rollout(problem, x0, U)
+        objective = f(u_solution)
 
         return U, X, objective
     end

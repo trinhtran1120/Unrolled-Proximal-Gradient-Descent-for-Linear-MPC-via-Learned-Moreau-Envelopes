@@ -24,12 +24,7 @@ pgm_max_iter = 1000
 
 mpc_data = mpc_problem()
 solve_mpc = mpc_solver(solver_name, mpc_data, tol)
-solve_pgm = PGM_solver(
-    mpc_data;
-    rho = pgm_rho,
-    max_iter = pgm_max_iter,
-    tol = tol,
-)
+solve_pgm = PGM_solver(mpc_data; rho = pgm_rho, max_iter = pgm_max_iter, tol = tol)
 cost_func = mpc_data.cost_func
 
 data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
@@ -55,6 +50,7 @@ test_pool = [
     [2.0, 0.0],
 ]
 
+## train data generation
 for x0 in train_pool
     println("================ Collecting training data with initial state = $x0 ================")
     println("---------------- $solver_name ----------------")
@@ -68,7 +64,7 @@ for x0 in train_pool
         data = data_train,
         verbose = true,
     )
-    J_PGM = trajectory_cost(mpc_data, pgm_X, pgm_U)
+    J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
 
     @printf("J_PGM = %8.4f\n", J_PGM)
     @printf("Delta J/J = %8.4f%%\n", abs(J_opt - J_PGM) / abs(J_opt) * 100)
@@ -92,7 +88,7 @@ npzwrite(
 )
 
 
-
+## test data generation
 for x0 in test_pool
     println("================ Collecting testing data with initial state = $x0 ================")
 
@@ -101,7 +97,7 @@ for x0 in test_pool
         data = data_test,
         verbose = true,
     )
-    J_PGM = trajectory_cost(mpc_data, pgm_X, pgm_U)
+    J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
     @printf("J_PGM = %8.4f\n", J_PGM)
 end
 
