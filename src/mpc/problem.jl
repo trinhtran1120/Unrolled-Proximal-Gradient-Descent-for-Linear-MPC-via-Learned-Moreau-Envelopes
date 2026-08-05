@@ -10,6 +10,30 @@ function (obj::StageCost)(x::AbstractVector, u::AbstractVector)
     return 0.5 * dot(x, obj.Q * x) + 0.5 * dot(u, obj.R * u)
 end
 
+function convert_matrix(
+    A::Matrix{Float64},
+    B::Matrix{Float64},
+    N::Int,
+)
+    nx = size(A, 1)
+    nu = size(B, 2)
+
+    A_ro = zeros(Float64, N * nx, nx)
+    B_ro = zeros(Float64, N * nx, N * nu)
+
+    for k in 1:N
+        row_idx = (k - 1) * nx + 1:k * nx
+        A_ro[row_idx, :] .= A^k
+
+        for j in 1:k
+            col_idx = (j - 1) * nu + 1:j * nu
+            B_ro[row_idx, col_idx] .= A^(k - j) * B
+        end
+    end
+
+    return A_ro, B_ro
+end
+
 # Define the MPC problem data
 struct LinearMPC
     A::Matrix{Float64}
@@ -28,7 +52,12 @@ struct LinearMPC
     N::Int
 
     cost_func::StageCost
+
+    A_ro::Matrix{Float64}
+    B_ro::Matrix{Float64}
 end
+
+
 
 function mpc_problem()
     A = [2.0 -1.0; 1.0 0.2]
@@ -47,6 +76,7 @@ function mpc_problem()
     N = 10
 
     cost_func = StageCost(Q, R)
+    A_ro, B_ro = convert_matrix(A, B, N)
 
     return LinearMPC(
         A,
@@ -62,5 +92,7 @@ function mpc_problem()
         nu,
         N,
         cost_func,
+        A_ro,
+        B_ro,
     )
 end

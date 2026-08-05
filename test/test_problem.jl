@@ -9,6 +9,8 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "problem.jl"))
     @test size(problem.B) == (problem.nx, problem.nu)
     @test size(problem.Q) == (problem.nx, problem.nx)
     @test size(problem.R) == (problem.nu, problem.nu)
+    @test size(problem.A_ro) == (problem.N * problem.nx, problem.nx)
+    @test size(problem.B_ro) == (problem.N * problem.nx, problem.N * problem.nu)
 
     @test problem.xmin < problem.xmax
     @test problem.umin < problem.umax

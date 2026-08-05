@@ -12,24 +12,25 @@ using Printf
 include(joinpath(@__DIR__, "..", "mpc", "problem.jl"))
 include(joinpath(@__DIR__, "..", "utils", "preprocess.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
-include(joinpath(@__DIR__, "..", "mpc", "pgm_std.jl"))
+include(joinpath(@__DIR__, "..", "mpc", "pgm.jl"))
 
 const DATASET_DIR = joinpath(@__DIR__, "..", "..", "data")
 mkpath(DATASET_DIR)
 
 solver_name = "OSQP"
 tol = 1e-2
-pgm_rho = 1.0
+pgm_rho = 0.1
 pgm_max_iter = 1000
 
 mpc_data = mpc_problem()
 solve_mpc = mpc_solver(solver_name, mpc_data, tol)
+solve_pgm = PGM_solver(
+    mpc_data;
+    rho = pgm_rho,
+    max_iter = pgm_max_iter,
+    tol = tol,
+)
 cost_func = mpc_data.cost_func
-
-
-function trajectory_cost(problem::LinearMPC, X::Matrix{Float64}, U::Matrix{Float64})
-    return sum(problem.cost_func(X[:, k], U[:, k]) for k in 1:problem.N)
-end
 
 data_train = Dict(
     "input" => Vector{Float64}[],
@@ -68,30 +69,20 @@ for x0 in train_pool
     println("================ Collecting training data with initial state = $x0 ================")
     println("---------------- $solver_name ----------------")
 
-    opt_X, opt_U, _solver_time, J_opt = solve_mpc(x0; verbose=true)
+    opt_X, opt_U, _solver_time, J_opt = solve_mpc(x0; verbose=false)
     @printf("J_opt = %8.4f\n", J_opt)
 
     println("---------------- PGM ----------------")
-    pgm_sol = PGM(
-        mpc_data,
+    pgm_U, pgm_X, _pgm_objective = solve_pgm(
         x0;
-        rho = pgm_rho,
-        max_iter = pgm_max_iter,
-        tol = tol,
+        data = data_train,
         verbose = true,
     )
-    J_PGM = trajectory_cost(mpc_data, pgm_sol.X, pgm_sol.U)
+    J_PGM = trajectory_cost(mpc_data, pgm_X, pgm_U)
 
     @printf("J_PGM = %8.4f\n", J_PGM)
     @printf("Delta J/J = %8.4f%%\n", abs(J_opt - J_PGM) / abs(J_opt) * 100)
-    @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_sol.U)))
-
-    for i in eachindex(pgm_sol.W_data)
-        push!(data_train["input"], vcat(pgm_sol.W_data[i], x0))
-        push!(data_train["env"], pgm_sol.ME_data[i])
-        push!(data_train["grad"], pgm_sol.ME_grad_data[i])
-        push!(data_train["gamma"], pgm_sol.gamma_data[i])
-    end
+    @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_U)))
 end
 
 @printf("Collected %4d training data points\n\n", length(data_train["input"]))
@@ -113,23 +104,13 @@ npzwrite(
 for x0 in test_pool
     println("================ Collecting testing data with initial state = $x0 ================")
 
-    pgm_sol = PGM(
-        mpc_data,
+    pgm_U, pgm_X, _pgm_objective = solve_pgm(
         x0;
-        rho = pgm_rho,
-        max_iter = pgm_max_iter,
-        tol = tol,
+        data = data_test,
         verbose = true,
     )
-    J_PGM = trajectory_cost(mpc_data, pgm_sol.X, pgm_sol.U)
+    J_PGM = trajectory_cost(mpc_data, pgm_X, pgm_U)
     @printf("J_PGM = %8.4f\n", J_PGM)
-
-    for i in eachindex(pgm_sol.W_data)
-        push!(data_test["input"], vcat(pgm_sol.W_data[i], x0))
-        push!(data_test["env"], pgm_sol.ME_data[i])
-        push!(data_test["grad"], pgm_sol.ME_grad_data[i])
-        push!(data_test["gamma"], pgm_sol.gamma_data[i])
-    end
 end
 
 # @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
