@@ -73,7 +73,7 @@ data/PGM-rho=0.1_nx=2_N=10-test.npz
 
 ## Train the ICNN
 
-Train and export the learned Moreau-envelope model:
+Train and export the learned squared-distance model:
 
 ```bash
 python src/learning/train_icnn.py
@@ -82,14 +82,14 @@ python src/learning/train_icnn.py
 The training script currently reads the `rho=0.1` datasets and writes:
 
 ```text
-model/linear-mpc-icnn-rho=0.1-gamma.pkl
-model/linear-mpc-icnn-rho=0.1-gamma.json
+model/linear-mpc-icnn-rho=0.1-distance.pkl
+model/linear-mpc-icnn-rho=0.1-distance.json
 ```
 
-Note: `src/scripts/get_benchmark.jl` currently loads
-`model/linear-mpc-icnn-rho=0.json`. If you retrain with the current Python
-script, update the benchmark model path or rename/copy the exported JSON file
-before benchmarking.
+The pickle file uses the same `linear-mpc-icnn-rho=0.1-distance` stem. The ICNN
+learns half the squared distance to the MPC feasible set from `[y, x0]`.
+At runtime, the learned PGM divides its value and gradient by the current
+positive `gamma` to recover the corresponding Moreau envelope exactly.
 
 ## Run the Benchmark
 

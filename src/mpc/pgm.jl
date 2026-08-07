@@ -62,6 +62,17 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
     return DifferentiableQuadratic(H, h)
 end
 
+function grad_cost(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
+    f = single_shooting_cost(problem, x0)
+    variable_cost, grad = ProximalAlgorithms.value_and_gradient(f, vec(U))
+
+    zero_U = zeros(Float64, problem.nu, problem.N)
+    zero_X = rollout(problem, x0, zero_U)
+    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N)
+
+    return variable_cost + constant_cost, reshape(grad, problem.nu, problem.N)
+end
+
 function constraint(problem::LinearMPC, x0::Vector{Float64}; solver=:osqp)
     A_ro = problem.A_ro
     B_ro = problem.B_ro
@@ -123,11 +134,13 @@ function PGM_solver(
             moreau_grad = similar(state.y)
             moreau_value = ProximalCore.gradient!(moreau_grad, moreau, state.y)
 
-            if data !== nothing
-                push!(data["input"], vcat(state.y, x0))
-                push!(data["env"], moreau_value)
-                push!(data["grad"], copy(moreau_grad))
-                push!(data["gamma"], state.gamma)
+            if data !== nothing 
+                # if moreau_value > 1e-6 || rand() < 0.1
+                    push!(data["input"], vcat(state.y, x0))
+                    push!(data["env"], moreau_value)
+                    push!(data["grad"], copy(moreau_grad))
+                    push!(data["gamma"], state.gamma)
+                # end
             end
 
             residual = norm(state.res, Inf) / state.gamma

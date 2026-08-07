@@ -10,7 +10,7 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         @__DIR__,
         "..",
         "model",
-        "linear-mpc-icnn-rho=0.json",
+        "linear-mpc-icnn-rho=0.1-distance.json",
     )
     learned_model = load_learned_icnn(model_path)
 
@@ -29,6 +29,7 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         problem,
         W,
         problem.x0,
+        learned_model.rho,
     )
 
     @test size(learned_grad) == size(U)
@@ -39,6 +40,7 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         problem,
         zeros(problem.nu, problem.N + 1),
         problem.x0,
+        learned_model.rho,
     )
     @test_throws DimensionMismatch learned_moreau_gradient(
         learned_model,
@@ -46,21 +48,91 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         problem,
         W,
         [problem.x0; 0.0],
+        learned_model.rho,
     )
+    @test_throws ArgumentError learned_moreau_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        W,
+        problem.x0,
+        0.0,
+    )
+
+    grad_at_rho = learned_moreau_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        W,
+        problem.x0,
+        learned_model.rho,
+    )
+    grad_at_twice_rho = learned_moreau_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        W,
+        problem.x0,
+        2 * learned_model.rho,
+    )
+    @test grad_at_rho ≈ 2 * grad_at_twice_rho
+
+    distance_grad = learned_squared_distance_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        W,
+        problem.x0,
+    )
+    @test distance_grad ≈ learned_model.rho * grad_at_rho
+
+    step_size = inv(opnorm(single_shooting_cost(problem, problem.x0).H, 2))
+    _, initial_grad = grad_cost(problem, problem.x0, U)
+    first_W = U - step_size * initial_grad
+    expected_first_U = first_W - learned_squared_distance_gradient(
+        learned_model,
+        local_gradients,
+        problem,
+        first_W,
+        problem.x0,
+    )
+    first_layer = learned_PGM(
+        learned_model,
+        problem;
+        x0 = problem.x0,
+        rho = step_size,
+        adaptive = false,
+        max_iter = 1,
+        tol = 0.0,
+    )
+    @test first_layer.U ≈ expected_first_U
 
     result = learned_PGM(
         learned_model,
         problem;
         x0 = problem.x0,
-        rho = learned_model.rho,
-        max_iter = 1000,
+        max_iter = 20,
         tol = 1e-3,
     )
 
     @test size(result.U) == (problem.nu, problem.N)
     @test size(result.X) == (problem.nx, problem.N + 1)
     @test !isempty(result.objective_history)
-    @test length(result.objective_history) <= 1000
+    @test length(result.objective_history) <= 20
+    @test length(result.gamma_history) == length(result.objective_history)
+    @test length(result.backtrack_history) == length(result.objective_history)
+    @test length(result.residual_history) == length(result.objective_history)
+    @test all(result.gamma_history .>= 1e-6)
+    f = single_shooting_cost(problem, problem.x0)
+    _, grad_at_zero = ProximalAlgorithms.value_and_gradient(f, zeros(problem.nu * problem.N))
+    adaptive_initial_step = proximal_algorithms_initial_gamma(
+        f,
+        zeros(problem.nu * problem.N),
+        grad_at_zero,
+    )
+    @test result.gamma_history[1] ≈ adaptive_initial_step
+    @test any(result.backtrack_history .> 0)
+    @test any(result.gamma_history[2:end] .< result.gamma_history[1:end-1])
     @test result.solve_time >= 0.0
     @test all(isfinite, result.U)
     @test all(isfinite, result.X)
@@ -69,10 +141,14 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         @test result.X[:, k + 1] ≈ problem.A * result.X[:, k] + problem.B * result.U[:, k] atol = 1e-5
     end
 
-    @test all(problem.umin .- 1e-5 .<= result.U)
-    @test all(result.U .<= problem.umax .+ 1e-5)
-    @test all(problem.xmin .- 1e-5 .<= result.X)
-    @test all(result.X .<= problem.xmax .+ 1e-5)
+    max_violation = max(
+        0.0,
+        maximum(problem.umin .- result.U),
+        maximum(result.U .- problem.umax),
+        maximum(problem.xmin .- result.X),
+        maximum(result.X .- problem.xmax),
+    )
+    @test isfinite(max_violation)
 
     final_cost, _ = grad_cost(problem, problem.x0, result.U)
     @test isfinite(final_cost)

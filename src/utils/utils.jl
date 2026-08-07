@@ -58,7 +58,7 @@ function load_learned_icnn(path::AbstractString)
     )
 end
 
-function moreau_envelope(model::LearnedICNN, input::AbstractVector)
+function squared_distance_value(model::LearnedICNN, input::AbstractVector)
     normalized_input = (input .- model.input_mean) ./ model.input_std
     z = softplus.(model.U[1] * normalized_input .+ model.b[1])
 
@@ -74,7 +74,18 @@ function moreau_envelope(model::LearnedICNN, input::AbstractVector)
     return model.env_scale * softplus(raw_output)
 end
 
-function learned_moreau_full_gradient(
+function moreau_envelope(
+    model::LearnedICNN,
+    input::AbstractVector,
+    gamma::Real,
+)
+    if !isfinite(gamma) || gamma <= 0
+        throw(ArgumentError("gamma must be finite and strictly positive, got $gamma"))
+    end
+    return squared_distance_value(model, input) / gamma
+end
+
+function learned_squared_distance_full_gradient(
     model::LearnedICNN,
     local_gradients::NTuple,
     input::AbstractVector,
@@ -90,6 +101,18 @@ function learned_moreau_full_gradient(
     )
 
     return full_gradient
+end
+
+function learned_moreau_full_gradient(
+    model::LearnedICNN,
+    local_gradients::NTuple,
+    input::AbstractVector,
+    gamma::Real,
+)
+    if !isfinite(gamma) || gamma <= 0
+        throw(ArgumentError("gamma must be finite and strictly positive, got $gamma"))
+    end
+    return learned_squared_distance_full_gradient(model, local_gradients, input) / gamma
 end
 
 

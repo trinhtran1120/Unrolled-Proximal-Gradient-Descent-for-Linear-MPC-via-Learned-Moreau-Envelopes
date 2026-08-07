@@ -4,10 +4,12 @@ Pkg.activate(joinpath(@__DIR__, "..", ".."))
 Pkg.instantiate()
 
 using JuMP
+import MathOptInterface as MOI
 using LinearAlgebra
 using NPZ
 using OSQP, Gurobi, Ipopt, MosekTools
 using Printf
+using Random
 
 include(joinpath(@__DIR__, "..", "mpc", "problem.jl"))
 include(joinpath(@__DIR__, "..", "utils", "preprocess.jl"))
@@ -21,34 +23,118 @@ solver_name = "Gurobi"
 tol = 1e-2
 pgm_rho = 0.1
 pgm_max_iter = 1000
+near_zero_env_tol = 1e-12
+near_zero_grad_tol = 1e-10
+zero_to_nonzero_ratio = 0.1
 
 mpc_data = mpc_problem()
-solve_mpc = mpc_solver(solver_name, mpc_data, tol)
+solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
 solve_pgm = PGM_solver(mpc_data; rho = pgm_rho, max_iter = pgm_max_iter, tol = tol)
 cost_func = mpc_data.cost_func
 
 data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
 data_test = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
 
-train_pool = [
-    [3.0, 1.0],
-    [2.5, 0.5],
-    [1.5, -0.5],
-    [2.5, 1.0],
-    [2.0, 1.0],
-    [2.0, 0.5],
-    [2.0, 0.0],
-    [1.5, 1.0],
-    [1.5, 0.5],
-    [1.5, 0.0],
-    [1.0, 1.0],
-    [1.0, 0.5],
-    [1.0, -0.5],
+function downsample_near_zero!(
+    data;
+    env_tol,
+    grad_tol,
+    zero_to_nonzero_ratio,
+    seed = 1234,
+)
+    sample_count = length(data["env"])
+    informative = [
+        data["env"][i] > env_tol || norm(data["grad"][i], Inf) > grad_tol
+        for i in 1:sample_count
+    ]
+    informative_indices = findall(informative)
+    near_zero_indices = findall(.!informative)
+
+    isempty(informative_indices) && error("No informative training samples were generated")
+
+    max_near_zero = min(
+        length(near_zero_indices),
+        round(Int, zero_to_nonzero_ratio * length(informative_indices)),
+    )
+    rng = MersenneTwister(seed)
+    retained_near_zero = if max_near_zero == 0
+        Int[]
+    else
+        shuffle(rng, near_zero_indices)[1:max_near_zero]
+    end
+    retained_indices = sort!(vcat(informative_indices, retained_near_zero))
+
+    for key in ("input", "env", "grad", "gamma")
+        data[key] = data[key][retained_indices]
+    end
+
+    return (
+        generated = sample_count,
+        informative = length(informative_indices),
+        retained_near_zero = length(retained_near_zero),
+        removed_near_zero = length(near_zero_indices) - length(retained_near_zero),
+        retained = length(retained_indices),
+    )
+end
+
+function initial_state_feasibility_checker(problem, solver_name)
+    model = pick_solver(solver_name)
+    nx, nu, N = problem.nx, problem.nu, problem.N
+
+    @variable(model, problem.xmin <= x[1:nx, 1:N+1] <= problem.xmax)
+    @variable(model, problem.umin <= u[1:nu, 1:N] <= problem.umax)
+    @variable(model, x0[i in 1:nx] in MOI.Parameter(problem.x0[i]))
+
+    @constraint(model, x[:, 1] .== x0)
+    for k in 1:N
+        @constraint(model, x[:, k+1] .== problem.A * x[:, k] + problem.B * u[:, k])
+    end
+    @objective(model, Min, 0.0)
+
+    return function (init)
+        set_parameter_value.(x0, init)
+        optimize!(model)
+        return termination_status(model) == MOI.OPTIMAL &&
+               primal_status(model) == MOI.FEASIBLE_POINT
+    end
+end
+
+is_feasible = initial_state_feasibility_checker(mpc_data, solver_name)
+
+# Split feasible initial states spatially. Nearby grid points generally land in
+# different subsets, while every PGM trajectory remains entirely in one subset.
+x1_grid = -2.0:0.5:3.0
+x2_grid = -2.0:0.5:4.0
+candidate_points = [
+    (ix = ix, iy = iy, x0 = [Float64(x1), Float64(x2)])
+    for (ix, x1) in enumerate(x1_grid)
+    for (iy, x2) in enumerate(x2_grid)
 ]
+feasible_points = filter(point -> is_feasible(point.x0), candidate_points)
+
+holdout_states = [[2.0, 0.0], [3.0, 4.0]]
+is_holdout(point) = any(
+    isapprox(point.x0, holdout; atol = 1e-12) for holdout in holdout_states
+)
+is_spatial_test(point) = mod(point.ix + 2 * point.iy, 7) == 0
 
 test_pool = [
-    [2.0, 0.0],
+    point.x0 for point in feasible_points
+    if is_holdout(point) || is_spatial_test(point)
 ]
+train_pool = [
+    point.x0 for point in feasible_points
+    if !is_holdout(point) && !is_spatial_test(point)
+]
+
+@printf(
+    "Initial-state grid: %d candidates, %d feasible, %d training, %d testing\n\n",
+    length(candidate_points),
+    length(feasible_points),
+    length(train_pool),
+    length(test_pool),
+)
+
 
 ## train data generation
 for x0 in train_pool
@@ -71,7 +157,20 @@ for x0 in train_pool
     @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_U)))
 end
 
-@printf("Collected %4d training data points\n\n", length(data_train["input"]))
+filter_stats = downsample_near_zero!(
+    data_train;
+    env_tol = near_zero_env_tol,
+    grad_tol = near_zero_grad_tol,
+    zero_to_nonzero_ratio = zero_to_nonzero_ratio,
+)
+@printf(
+    "Training samples: %d generated, %d informative, %d near-zero retained, %d near-zero removed, %d total retained\n\n",
+    filter_stats.generated,
+    filter_stats.informative,
+    filter_stats.retained_near_zero,
+    filter_stats.removed_near_zero,
+    filter_stats.retained,
+)
 train_data = Dict(
     "input" => reduce(hcat, data_train["input"]),
     "grad" => reduce(hcat, data_train["grad"]),

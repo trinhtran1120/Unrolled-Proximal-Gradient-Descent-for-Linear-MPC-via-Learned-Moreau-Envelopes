@@ -6,7 +6,7 @@ include("../utils/preprocess.jl")
 
 function mpc_solver(name, problem, tol)
     # Build model
-    model = pick_solver(name)
+    model = pick_solver(name, tol)
 
     # Extract data
     A = problem.A 

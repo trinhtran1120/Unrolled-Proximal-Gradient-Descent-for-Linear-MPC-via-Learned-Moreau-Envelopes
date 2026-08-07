@@ -18,16 +18,17 @@ MODEL_DIR = PROJECT_DIR / "model"
 
 TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-train.npz"
 TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-test.npz"
-MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.1-gamma"
+MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.1-distance"
 
-WIDTHS = [16, 16]
+WIDTHS = [32, 32]
 LEARNING_RATE = 1e-3
-GRAD_WEIGHT = 10.0
+GRAD_WEIGHT = 5.0
 L2_REG = 0.0
 BATCH_SIZE = 64
 EPOCHS = 5000
 SEED = 0
 NORMALIZATION_EPS = 1e-8
+SCALE_DATA = True
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -42,11 +43,11 @@ from icnn import (
 
 
 def load_dataset(path: Path):
-    """Load a linear-MPC Moreau-envelope dataset in learner-friendly orientation."""
+    """Load gamma-independent squared-distance targets for the MPC feasible set."""
     with np.load(path) as data:
         X = data["input"].T
-        y = data["env"]
-        g = data["grad"].T
+        env = data["env"]
+        env_grad = data["grad"].T
 
         if "gamma" not in data:
             raise KeyError(
@@ -54,24 +55,37 @@ def load_dataset(path: Path):
                 "adaptive PGM logging before training this model."
             )
 
-        gamma = np.asarray(data["gamma"]).reshape(-1, 1)
+        gamma = np.asarray(data["gamma"], dtype=float).reshape(-1, 1)
         if gamma.shape[0] != X.shape[0]:
             raise ValueError(
                 "gamma must contain one value per sample: "
                 f"got {gamma.shape[0]} gamma values for {X.shape[0]} samples"
             )
+        if not np.all(np.isfinite(gamma)) or np.any(gamma <= 0.0):
+            raise ValueError("gamma values must be finite and strictly positive")
 
         rho_key = "rho_initial" if "rho_initial" in data else "rho"
         return (
-            np.hstack([X, gamma]),
-            y,
-            g,
+            X,
+            gamma[:, 0] * env,
+            gamma * env_grad,
             float(data[rho_key]),
         )
 
 
-def fit_normalization(X: np.ndarray, y: np.ndarray) -> dict[str, np.ndarray | float]:
+def fit_normalization(
+    X: np.ndarray,
+    y: np.ndarray,
+    scale_data: bool = SCALE_DATA,
+) -> dict[str, np.ndarray | float]:
     """Fit normalization constants from training data only."""
+    if not scale_data:
+        return {
+            "input_mean": np.zeros(X.shape[1]),
+            "input_std": np.ones(X.shape[1]),
+            "env_scale": 1.0,
+        }
+
     input_mean = X.mean(axis=0)
     input_std = X.std(axis=0)
     input_std = np.where(input_std < NORMALIZATION_EPS, 1.0, input_std)
@@ -147,11 +161,13 @@ def prepare_for_export(params, rho, normalization):
 def save_model(params, path: Path) -> None:
     """Save the trained ICNN in both pickle and JSON formats."""
     path.parent.mkdir(parents=True, exist_ok=True)
+    pickle_path = Path(f"{path}.pkl")
+    json_path = Path(f"{path}.json")
 
-    with open(path.with_suffix(".pkl"), "wb") as f:
+    with open(pickle_path, "wb") as f:
         pickle.dump(params, f)
 
-    with open(path.with_suffix(".json"), "w") as f:
+    with open(json_path, "w") as f:
         json.dump(to_serializable(params), f)
 
 
@@ -165,8 +181,11 @@ if __name__ == "__main__":
     print(f"Number of data: {n_samples}")
     print(f"Input dimension: {n_features}")
     print(f"Gradient target dimension: {gtr.shape[1]}")
+    print("Target: 0.5 * squared distance to the MPC feasible set")
 
-    normalization = fit_normalization(Xtr, ytr)
+    print(f"Scale data: {SCALE_DATA}")
+
+    normalization = fit_normalization(Xtr, ytr, SCALE_DATA)
     Xtr_norm, ytr_norm, gtr_norm = apply_normalization(Xtr, ytr, gtr, normalization)
     Xva_norm, yva_norm, gva_norm = apply_normalization(Xva, yva, gva, normalization)
 
@@ -190,9 +209,12 @@ if __name__ == "__main__":
     norm_val_mse, norm_grad_mse = evaluate_normalized(params, Xva_norm, yva_norm, gva_norm)
     val_mse, grad_mse = evaluate(params, Xva, yva, gva, normalization)
     print(
-        f"[TEST] value MSE: {norm_val_mse:.4e} "
+        f"[TEST distance] normalized value MSE: {norm_val_mse:.4e} "
         f"| grad MSE: {norm_grad_mse:.4e}"
     )
-    # print(f"[TEST original] value MSE: {val_mse:.4e} | grad MSE: {grad_mse:.4e}")
+    print(
+        f"[TEST distance original] value MSE: {val_mse:.4e} "
+        f"| grad MSE: {grad_mse:.4e}"
+    )
 
     save_model(prepare_for_export(params, rho, normalization), MODEL_PATH)
