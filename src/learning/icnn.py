@@ -10,7 +10,7 @@ import numpy as np
 import optax
 
 Params = dict[str, Any]
-Batch = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]
+Batch = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 DEFAULT_WIDTHS = (64, 64, 64)
 INIT_SCALE = 0.05
@@ -116,14 +116,17 @@ def loss_fn(
     xb: jnp.ndarray,
     yb: jnp.ndarray,
     gb: jnp.ndarray,
+    wb: jnp.ndarray,
     grad_weight: float = 1.0,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
     """Return total loss and its value/gradient MSE components."""
     y_pred = batched_forward(params, xb)
     g_pred = batched_grad_wrt_x(params, xb)[:, : gb.shape[1]]
 
-    value_mse = jnp.mean((y_pred - yb) ** 2)
-    grad_mse = jnp.mean(jnp.sum((g_pred - gb) ** 2, axis=1))
+    weight_scale = jnp.maximum(jnp.mean(wb), 1e-12)
+    normalized_weights = wb / weight_scale
+    value_mse = jnp.mean(normalized_weights * (y_pred - yb) ** 2)
+    grad_mse = jnp.mean(normalized_weights * jnp.sum((g_pred - gb) ** 2, axis=1))
     return value_mse + grad_weight * grad_mse, (value_mse, grad_mse)
 
 
@@ -131,6 +134,7 @@ def batch_iterator(
     X: jnp.ndarray,
     y: jnp.ndarray,
     g: jnp.ndarray,
+    w: jnp.ndarray,
     batch_size: int,
     shuffle_key: jax.Array,
 ) -> Iterator[Batch]:
@@ -141,7 +145,7 @@ def batch_iterator(
     permutation = jax.random.permutation(shuffle_key, X.shape[0])
     for start in range(0, X.shape[0], batch_size):
         indices = permutation[start : start + batch_size]
-        yield X[indices], y[indices], g[indices]
+        yield X[indices], y[indices], g[indices], w[indices]
 
 
 def make_train_step(optimizer: optax.GradientTransformation):
@@ -154,10 +158,11 @@ def make_train_step(optimizer: optax.GradientTransformation):
         xb: jnp.ndarray,
         yb: jnp.ndarray,
         gb: jnp.ndarray,
+        wb: jnp.ndarray,
         grad_weight: float,
     ):
         (loss, (vmse, gmse)), grads = jax.value_and_grad(loss_fn, has_aux=True)(
-            params, xb, yb, gb, grad_weight
+            params, xb, yb, gb, wb, grad_weight
         )
         updates, opt_state = optimizer.update(grads, opt_state, params)
         params = optax.apply_updates(params, updates)
@@ -170,11 +175,13 @@ def _as_training_arrays(
     X: np.ndarray,
     y: np.ndarray,
     g: np.ndarray,
+    w: np.ndarray,
     n_in: int,
-) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     Xj = jnp.asarray(X, dtype=jnp.float32)
     yj = jnp.asarray(y, dtype=jnp.float32)
     gj = jnp.asarray(g, dtype=jnp.float32)
+    wj = jnp.asarray(w, dtype=jnp.float32)
 
     if Xj.ndim != 2 or Xj.shape[1] != n_in:
         raise ValueError(f"X must have shape (N, {n_in})")
@@ -185,8 +192,12 @@ def _as_training_arrays(
             "g must have shape (N, grad_dim), where grad_dim is no larger "
             f"than the input dimension {Xj.shape[1]}"
         )
+    if wj.shape != (Xj.shape[0],):
+        raise ValueError("w must have shape (N,)")
+    if np.any(np.asarray(w) <= 0.0):
+        raise ValueError("all sample weights must be strictly positive")
 
-    return Xj, yj, gj
+    return Xj, yj, gj, wj
 
 
 def _copy_params(params: Params) -> Params:
@@ -201,6 +212,7 @@ def train_icnn(
     y: np.ndarray,
     g: np.ndarray,
     n_in: int,
+    w: np.ndarray | None = None,
     widths: Sequence[int] = DEFAULT_WIDTHS,
     lr: float = 1e-3,
     grad_weight: float = 1.0,
@@ -211,6 +223,7 @@ def train_icnn(
     X_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     g_val: np.ndarray | None = None,
+    w_val: np.ndarray | None = None,
 ) -> Params:
     """Train an ICNN with value and input-gradient supervision."""
     if epochs < 0:
@@ -218,12 +231,18 @@ def train_icnn(
 
     key = jax.random.PRNGKey(seed)
     widths = _validate_widths(widths)
-    Xj, yj, gj = _as_training_arrays(X, y, g, n_in)
-    has_validation = X_val is not None or y_val is not None or g_val is not None
+    if w is None:
+        w = np.ones(X.shape[0])
+    Xj, yj, gj, wj = _as_training_arrays(X, y, g, w, n_in)
+    has_validation = (
+        X_val is not None or y_val is not None or g_val is not None or w_val is not None
+    )
     if has_validation:
         if X_val is None or y_val is None or g_val is None:
             raise ValueError("X_val, y_val, and g_val must be provided together")
-        Xvj, yvj, gvj = _as_training_arrays(X_val, y_val, g_val, n_in)
+        if w_val is None:
+            w_val = np.ones(X_val.shape[0])
+        Xvj, yvj, gvj, wvj = _as_training_arrays(X_val, y_val, g_val, w_val, n_in)
 
     params = init_icnn_params(key, n_in=n_in, widths=widths)
     best_params = params
@@ -235,24 +254,30 @@ def train_icnn(
 
     for epoch in range(1, epochs + 1):
         batch_key, key = jax.random.split(key)
-        for xb, yb, gb in batch_iterator(Xj, yj, gj, batch_size, batch_key):
+        for xb, yb, gb, wb in batch_iterator(Xj, yj, gj, wj, batch_size, batch_key):
             params, opt_state, _loss, _vmse, _gmse = train_step(
-                params, opt_state, xb, yb, gb, grad_weight
+                params, opt_state, xb, yb, gb, wb, grad_weight
             )
 
         if epoch % max(1, epochs // 10) == 0 or epoch == 1:
             with jax.disable_jit():
                 if has_validation:
-                    eval_X, eval_y, eval_g = Xvj, yvj, gvj
+                    eval_X, eval_y, eval_g, eval_w = Xvj, yvj, gvj, wvj
                     metric_label = "val"
                 else:
-                    eval_X, eval_y, eval_g = Xj[:1024], yj[:1024], gj[:1024]
+                    eval_X, eval_y, eval_g, eval_w = (
+                        Xj[:1024],
+                        yj[:1024],
+                        gj[:1024],
+                        wj[:1024],
+                    )
                     metric_label = "train"
 
                 yp = batched_forward(params, eval_X)
                 gp = batched_grad_wrt_x(params, eval_X)[:, : eval_g.shape[1]]
-                vm = jnp.mean((yp - eval_y) ** 2)
-                gm = jnp.mean(jnp.sum((gp - eval_g) ** 2, axis=1))
+                eval_w = eval_w / jnp.maximum(jnp.mean(eval_w), 1e-12)
+                vm = jnp.mean(eval_w * (yp - eval_y) ** 2)
+                gm = jnp.mean(eval_w * jnp.sum((gp - eval_g) ** 2, axis=1))
                 selection_obj = vm + grad_weight * gm
 
                 if float(selection_obj) < best_val:

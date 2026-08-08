@@ -16,6 +16,8 @@ struct LearnedICNN
     input_mean::Vector{Float64}
     input_std::Vector{Float64}
     env_scale::Float64
+    target::String
+    gamma_feature::String
 end
 
 softplus(x) = log1p(exp(-abs(x))) + max(x, zero(x))
@@ -32,6 +34,8 @@ end
 function load_learned_icnn(path::AbstractString)
     data = JSON3.read(read(path, String))
     input_dim = length(data["a"])
+    target = haskey(data, :target) ? String(data["target"]) : "half_squared_distance"
+    gamma_feature = haskey(data, :gamma_feature) ? String(data["gamma_feature"]) : "none"
 
     if haskey(data, :normalization)
         normalization = data["normalization"]
@@ -55,10 +59,12 @@ function load_learned_icnn(path::AbstractString)
         input_mean,
         input_std,
         env_scale,
+        target,
+        gamma_feature,
     )
 end
 
-function squared_distance_value(model::LearnedICNN, input::AbstractVector)
+function learned_value(model::LearnedICNN, input::AbstractVector)
     normalized_input = (input .- model.input_mean) ./ model.input_std
     z = softplus.(model.U[1] * normalized_input .+ model.b[1])
 
@@ -74,6 +80,23 @@ function squared_distance_value(model::LearnedICNN, input::AbstractVector)
     return model.env_scale * softplus(raw_output)
 end
 
+function squared_distance_value(model::LearnedICNN, input::AbstractVector)
+    if model.target != "half_squared_distance"
+        throw(ArgumentError("squared_distance_value requires target=half_squared_distance"))
+    end
+    return learned_value(model, input)
+end
+
+function learned_model_input(model::LearnedICNN, input::AbstractVector, gamma::Real)
+    if model.target == "moreau_envelope"
+        if model.gamma_feature != "gamma"
+            throw(ArgumentError("unsupported gamma feature $(model.gamma_feature)"))
+        end
+        return vcat(input, gamma)
+    end
+    return input
+end
+
 function moreau_envelope(
     model::LearnedICNN,
     input::AbstractVector,
@@ -82,10 +105,15 @@ function moreau_envelope(
     if !isfinite(gamma) || gamma <= 0
         throw(ArgumentError("gamma must be finite and strictly positive, got $gamma"))
     end
-    return squared_distance_value(model, input) / gamma
+    if model.target == "half_squared_distance"
+        return squared_distance_value(model, input) / gamma
+    elseif model.target == "moreau_envelope"
+        return learned_value(model, learned_model_input(model, input, gamma))
+    end
+    throw(ArgumentError("unsupported learned ICNN target $(model.target)"))
 end
 
-function learned_squared_distance_full_gradient(
+function learned_value_full_gradient(
     model::LearnedICNN,
     local_gradients::NTuple,
     input::AbstractVector,
@@ -103,6 +131,17 @@ function learned_squared_distance_full_gradient(
     return full_gradient
 end
 
+function learned_squared_distance_full_gradient(
+    model::LearnedICNN,
+    local_gradients::NTuple,
+    input::AbstractVector,
+)
+    if model.target != "half_squared_distance"
+        throw(ArgumentError("squared-distance gradient requires target=half_squared_distance"))
+    end
+    return learned_value_full_gradient(model, local_gradients, input)
+end
+
 function learned_moreau_full_gradient(
     model::LearnedICNN,
     local_gradients::NTuple,
@@ -112,7 +151,16 @@ function learned_moreau_full_gradient(
     if !isfinite(gamma) || gamma <= 0
         throw(ArgumentError("gamma must be finite and strictly positive, got $gamma"))
     end
-    return learned_squared_distance_full_gradient(model, local_gradients, input) / gamma
+    if model.target == "half_squared_distance"
+        return learned_squared_distance_full_gradient(model, local_gradients, input) / gamma
+    elseif model.target == "moreau_envelope"
+        return learned_value_full_gradient(
+            model,
+            local_gradients,
+            learned_model_input(model, input, gamma),
+        )
+    end
+    throw(ArgumentError("unsupported learned ICNN target $(model.target)"))
 end
 
 

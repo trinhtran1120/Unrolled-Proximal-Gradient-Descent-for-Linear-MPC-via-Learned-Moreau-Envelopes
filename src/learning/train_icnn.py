@@ -18,7 +18,7 @@ MODEL_DIR = PROJECT_DIR / "model"
 
 TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-train.npz"
 TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-test.npz"
-MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.1-distance"
+MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.1-moreau-conditional"
 
 WIDTHS = [32, 32]
 LEARNING_RATE = 1e-3
@@ -29,6 +29,9 @@ EPOCHS = 5000
 SEED = 0
 NORMALIZATION_EPS = 1e-8
 SCALE_DATA = True
+TARGET_MODE = "moreau_envelope"
+GAMMA_FEATURE = "gamma"
+WEIGHT_MODE = "gamma_squared"
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -43,7 +46,7 @@ from icnn import (
 
 
 def load_dataset(path: Path):
-    """Load gamma-independent squared-distance targets for the MPC feasible set."""
+    """Load Moreau-envelope data with the requested supervised target."""
     with np.load(path) as data:
         X = data["input"].T
         env = data["env"]
@@ -65,12 +68,41 @@ def load_dataset(path: Path):
             raise ValueError("gamma values must be finite and strictly positive")
 
         rho_key = "rho_initial" if "rho_initial" in data else "rho"
-        return (
-            X,
-            gamma[:, 0] * env,
-            gamma * env_grad,
-            float(data[rho_key]),
-        )
+        adaptive = bool(np.asarray(data["adaptive"]).item()) if "adaptive" in data else False
+        metadata = {
+            "rho_initial": float(data[rho_key]),
+            "rho_default": float(np.median(gamma)),
+            "adaptive": adaptive,
+            "gamma_min": float(np.min(gamma)),
+            "gamma_median": float(np.median(gamma)),
+            "gamma_mean": float(np.mean(gamma)),
+            "gamma_max": float(np.max(gamma)),
+        }
+        if TARGET_MODE == "half_squared_distance":
+            y = gamma[:, 0] * env
+            g = gamma * env_grad
+        elif TARGET_MODE == "moreau_envelope":
+            X = np.hstack([X, gamma])
+            y = env
+            g = env_grad
+        else:
+            raise ValueError(f"Unsupported TARGET_MODE: {TARGET_MODE}")
+
+        if WEIGHT_MODE == "none":
+            w = np.ones(X.shape[0])
+        elif WEIGHT_MODE == "gamma":
+            w = gamma[:, 0]
+        elif WEIGHT_MODE == "gamma_squared":
+            w = gamma[:, 0] ** 2
+        else:
+            raise ValueError(f"Unsupported WEIGHT_MODE: {WEIGHT_MODE}")
+
+        metadata["weight_mode"] = WEIGHT_MODE
+        metadata["weight_min"] = float(np.min(w))
+        metadata["weight_mean"] = float(np.mean(w))
+        metadata["weight_max"] = float(np.max(w))
+
+        return X, y, g, w, metadata
 
 
 def fit_normalization(
@@ -146,9 +178,20 @@ def evaluate(params, Xva, yva, gva, normalization):
     return val_mse, grad_mse
 
 
-def prepare_for_export(params, rho, normalization):
+def prepare_for_export(params, metadata, normalization):
     """Apply nonnegative ICNN projections expected by the Julia model loader."""
-    params["rho"] = rho
+    params["rho"] = metadata["rho_default"]
+    params["rho_initial"] = metadata["rho_initial"]
+    params["adaptive_data"] = metadata["adaptive"]
+    params["gamma_feature"] = GAMMA_FEATURE if TARGET_MODE == "moreau_envelope" else "none"
+    params["gamma_stats"] = {
+        "min": metadata["gamma_min"],
+        "median": metadata["gamma_median"],
+        "mean": metadata["gamma_mean"],
+        "max": metadata["gamma_max"],
+    }
+    params["target"] = TARGET_MODE
+    params["weight_mode"] = metadata["weight_mode"]
     params["normalization"] = normalization
     params["v"] = act_p(params["v"])
 
@@ -174,14 +217,39 @@ def save_model(params, path: Path) -> None:
 if __name__ == "__main__":
     print(jax.devices())
 
-    Xtr, ytr, gtr, rho = load_dataset(TRAIN_DATA_PATH)
-    Xva, yva, gva, _ = load_dataset(TEST_DATA_PATH)
+    Xtr, ytr, gtr, wtr, train_metadata = load_dataset(TRAIN_DATA_PATH)
+    Xva, yva, gva, wva, test_metadata = load_dataset(TEST_DATA_PATH)
 
     n_features, n_samples = Xtr.shape[1], Xtr.shape[0]
     print(f"Number of data: {n_samples}")
     print(f"Input dimension: {n_features}")
     print(f"Gradient target dimension: {gtr.shape[1]}")
-    print("Target: 0.5 * squared distance to the MPC feasible set")
+    print(f"Target: {TARGET_MODE}")
+    print(f"Gamma feature: {GAMMA_FEATURE if TARGET_MODE == 'moreau_envelope' else 'none'}")
+    print(f"Weight mode: {WEIGHT_MODE}")
+    print(f"Adaptive data: {train_metadata['adaptive']}")
+    print(f"rho initial: {train_metadata['rho_initial']:.4e}")
+    print(
+        "gamma train min/median/mean/max: "
+        f"{train_metadata['gamma_min']:.4e} / "
+        f"{train_metadata['gamma_median']:.4e} / "
+        f"{train_metadata['gamma_mean']:.4e} / "
+        f"{train_metadata['gamma_max']:.4e}"
+    )
+    print(
+        "gamma test  min/median/mean/max: "
+        f"{test_metadata['gamma_min']:.4e} / "
+        f"{test_metadata['gamma_median']:.4e} / "
+        f"{test_metadata['gamma_mean']:.4e} / "
+        f"{test_metadata['gamma_max']:.4e}"
+    )
+    print(f"Export default rho: {train_metadata['rho_default']:.4e}")
+    print(
+        "weight train min/mean/max: "
+        f"{train_metadata['weight_min']:.4e} / "
+        f"{train_metadata['weight_mean']:.4e} / "
+        f"{train_metadata['weight_max']:.4e}"
+    )
 
     print(f"Scale data: {SCALE_DATA}")
 
@@ -194,6 +262,7 @@ if __name__ == "__main__":
         ytr_norm,
         gtr_norm,
         n_in=n_features,
+        w=wtr,
         widths=WIDTHS,
         lr=LEARNING_RATE,
         grad_weight=GRAD_WEIGHT,
@@ -204,17 +273,18 @@ if __name__ == "__main__":
         X_val=Xva_norm,
         y_val=yva_norm,
         g_val=gva_norm,
+        w_val=wva,
     )
 
     norm_val_mse, norm_grad_mse = evaluate_normalized(params, Xva_norm, yva_norm, gva_norm)
     val_mse, grad_mse = evaluate(params, Xva, yva, gva, normalization)
     print(
-        f"[TEST distance] normalized value MSE: {norm_val_mse:.4e} "
+        f"[TEST {TARGET_MODE}] normalized value MSE: {norm_val_mse:.4e} "
         f"| grad MSE: {norm_grad_mse:.4e}"
     )
     print(
-        f"[TEST distance original] value MSE: {val_mse:.4e} "
+        f"[TEST {TARGET_MODE} original] value MSE: {val_mse:.4e} "
         f"| grad MSE: {grad_mse:.4e}"
     )
 
-    save_model(prepare_for_export(params, rho, normalization), MODEL_PATH)
+    save_model(prepare_for_export(params, train_metadata, normalization), MODEL_PATH)

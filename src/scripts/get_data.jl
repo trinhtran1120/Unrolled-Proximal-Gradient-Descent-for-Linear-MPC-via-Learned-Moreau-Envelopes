@@ -19,9 +19,10 @@ include(joinpath(@__DIR__, "..", "mpc", "pgm.jl"))
 const DATASET_DIR = joinpath(@__DIR__, "..", "..", "data")
 mkpath(DATASET_DIR)
 
-solver_name = "Gurobi"
+solver_name = "OSQP"
 tol = 1e-2
 pgm_rho = 0.1
+pgm_adaptive = true
 pgm_max_iter = 1000
 near_zero_env_tol = 1e-12
 near_zero_grad_tol = 1e-10
@@ -29,7 +30,13 @@ zero_to_nonzero_ratio = 0.1
 
 mpc_data = mpc_problem()
 solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
-solve_pgm = PGM_solver(mpc_data; rho = pgm_rho, max_iter = pgm_max_iter, tol = tol)
+solve_pgm = PGM_solver(
+    mpc_data;
+    rho = pgm_rho,
+    adaptive = pgm_adaptive,
+    max_iter = pgm_max_iter,
+    tol = tol,
+)
 cost_func = mpc_data.cost_func
 
 data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
@@ -175,6 +182,7 @@ train_data = Dict(
     "input" => reduce(hcat, data_train["input"]),
     "grad" => reduce(hcat, data_train["grad"]),
     "rho_initial" => pgm_rho,
+    "adaptive" => pgm_adaptive,
     "gamma" => data_train["gamma"],
     "env" => data_train["env"],
     "N" => mpc_data.N,
@@ -205,6 +213,7 @@ test_data = Dict(
     "input" => reduce(hcat, data_test["input"]),
     "grad" => reduce(hcat, data_test["grad"]),
     "rho_initial" => pgm_rho,
+    "adaptive" => pgm_adaptive,
     "gamma" => data_test["gamma"],
     "env" => data_test["env"],
     "N" => mpc_data.N,

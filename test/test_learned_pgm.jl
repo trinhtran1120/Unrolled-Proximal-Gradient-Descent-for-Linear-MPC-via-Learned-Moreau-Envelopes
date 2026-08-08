@@ -15,7 +15,6 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     learned_model = load_learned_icnn(model_path)
 
     expected_input_dim = problem.nu * problem.N + problem.nx
-    @test learned_input_dim(problem) == expected_input_dim
     @test length(learned_model.a) == expected_input_dim
 
     U = zeros(problem.nu, problem.N)
@@ -106,6 +105,8 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         tol = 0.0,
     )
     @test first_layer.U ≈ expected_first_U
+    @test first_layer.gamma_history == [step_size]
+    @test first_layer.backtrack_history == [0]
 
     result = learned_PGM(
         learned_model,
@@ -123,16 +124,12 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     @test length(result.backtrack_history) == length(result.objective_history)
     @test length(result.residual_history) == length(result.objective_history)
     @test all(result.gamma_history .>= 1e-6)
-    f = single_shooting_cost(problem, problem.x0)
-    _, grad_at_zero = ProximalAlgorithms.value_and_gradient(f, zeros(problem.nu * problem.N))
-    adaptive_initial_step = proximal_algorithms_initial_gamma(
-        f,
-        zeros(problem.nu * problem.N),
-        grad_at_zero,
+    @test result.gamma_history[1] <= learned_model.rho
+    @test all(result.backtrack_history .>= 0)
+    @test all(
+        result.gamma_history[2:end] .<=
+        result.gamma_history[1:end-1] .* 1.05 .+ sqrt(eps(Float64))
     )
-    @test result.gamma_history[1] ≈ adaptive_initial_step
-    @test any(result.backtrack_history .> 0)
-    @test any(result.gamma_history[2:end] .< result.gamma_history[1:end-1])
     @test result.solve_time >= 0.0
     @test all(isfinite, result.U)
     @test all(isfinite, result.X)

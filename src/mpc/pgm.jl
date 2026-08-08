@@ -104,9 +104,22 @@ end
 function PGM_solver(
     problem::LinearMPC;
     rho::Float64=0.01, #stepsize
+    adaptive::Bool=true,
+    minimum_gamma::Float64=1e-6,
+    reduce_gamma::Float64=0.5,
+    increase_gamma::Float64=1.05,
     max_iter::Int=1000,
     tol::Float64=1e-3,
 )
+    if !isfinite(rho) || rho <= 0
+        throw(ArgumentError("rho must be finite and strictly positive, got $rho"))
+    end
+    if minimum_gamma <= 0 || reduce_gamma <= 0 || reduce_gamma >= 1 || increase_gamma < 1
+        throw(ArgumentError(
+            "expected minimum_gamma > 0, 0 < reduce_gamma < 1, and increase_gamma >= 1",
+        ))
+    end
+
     nu = problem.nu
     N = problem.N
     u0 = zeros(Float64, nu * N)
@@ -120,11 +133,11 @@ function PGM_solver(
         f = f,
         g = g,
         x0 = u0,
-        gamma = nothing,
-        adaptive = true,
-        minimum_gamma = 1e-6,
-        reduce_gamma = 0.5,
-        increase_gamma = 1.05,
+        gamma = adaptive ? nothing : rho,
+        adaptive = adaptive,
+        minimum_gamma = minimum_gamma,
+        reduce_gamma = reduce_gamma,
+        increase_gamma = increase_gamma,
     )
 
         for (iter, state) in enumerate(ffb_iter)
