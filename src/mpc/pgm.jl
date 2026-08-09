@@ -133,7 +133,7 @@ function PGM_solver(
         f = f,
         g = g,
         x0 = u0,
-        gamma = adaptive ? nothing : rho,
+        gamma = rho,
         adaptive = adaptive,
         minimum_gamma = minimum_gamma,
         reduce_gamma = reduce_gamma,
@@ -147,12 +147,18 @@ function PGM_solver(
             moreau_grad = similar(state.y)
             moreau_value = ProximalCore.gradient!(moreau_grad, moreau, state.y)
 
-            if data !== nothing 
+            if data !== nothing &&
+               isfinite(state.gamma) &&
+               isfinite(moreau_value) &&
+               all(isfinite, moreau_grad)
                 # if moreau_value > 1e-6 || rand() < 0.1
                     push!(data["input"], vcat(state.y, x0))
                     push!(data["env"], moreau_value)
                     push!(data["grad"], copy(moreau_grad))
+                    push!(data["q"], state.gamma * moreau_value)
+                    push!(data["r"], state.gamma .* copy(moreau_grad))
                     push!(data["gamma"], state.gamma)
+                    push!(data["iter"], iter)
                 # end
             end
 

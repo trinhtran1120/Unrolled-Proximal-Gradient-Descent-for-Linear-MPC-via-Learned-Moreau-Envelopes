@@ -13,6 +13,7 @@ struct LearnedICNN
     a::Vector{Float64}
     c::Float64
     rho::Float64
+    rho_initial::Float64
     input_mean::Vector{Float64}
     input_std::Vector{Float64}
     env_scale::Float64
@@ -36,6 +37,8 @@ function load_learned_icnn(path::AbstractString)
     input_dim = length(data["a"])
     target = haskey(data, :target) ? String(data["target"]) : "half_squared_distance"
     gamma_feature = haskey(data, :gamma_feature) ? String(data["gamma_feature"]) : "none"
+    rho = Float64(data["rho"])
+    rho_initial = haskey(data, :rho_initial) ? Float64(data["rho_initial"]) : rho
 
     if haskey(data, :normalization)
         normalization = data["normalization"]
@@ -55,7 +58,8 @@ function load_learned_icnn(path::AbstractString)
         json_vector(data["v"]),
         json_vector(data["a"]),
         Float64(data["c"]),
-        Float64(data["rho"]),
+        rho,
+        rho_initial,
         input_mean,
         input_std,
         env_scale,

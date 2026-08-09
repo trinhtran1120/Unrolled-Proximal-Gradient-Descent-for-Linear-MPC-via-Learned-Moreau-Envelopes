@@ -1,4 +1,4 @@
-"""ICNN utilities trained with Moreau-envelope value and gradient supervision."""
+"""ICNN utilities trained with normalized-envelope value and gradient supervision."""
 
 from __future__ import annotations
 

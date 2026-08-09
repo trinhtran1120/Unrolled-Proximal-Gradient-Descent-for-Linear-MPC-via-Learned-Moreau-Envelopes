@@ -22,33 +22,16 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     local_gradients = (
         gradient_struct(icnn_from_learned(learned_model), 1, length(learned_model.a)),
     )
-    learned_grad = learned_moreau_gradient(
+    distance_grad = learned_squared_distance_gradient(
         learned_model,
         local_gradients,
         problem,
         W,
         problem.x0,
-        learned_model.rho,
     )
 
-    @test size(learned_grad) == size(U)
-    @test all(isfinite, learned_grad)
-    @test_throws DimensionMismatch learned_moreau_gradient(
-        learned_model,
-        local_gradients,
-        problem,
-        zeros(problem.nu, problem.N + 1),
-        problem.x0,
-        learned_model.rho,
-    )
-    @test_throws DimensionMismatch learned_moreau_gradient(
-        learned_model,
-        local_gradients,
-        problem,
-        W,
-        [problem.x0; 0.0],
-        learned_model.rho,
-    )
+    @test size(distance_grad) == size(U)
+    @test all(isfinite, distance_grad)
     @test_throws ArgumentError learned_moreau_gradient(
         learned_model,
         local_gradients,
@@ -76,25 +59,38 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     )
     @test grad_at_rho ≈ 2 * grad_at_twice_rho
 
-    distance_grad = learned_squared_distance_gradient(
+    @test distance_grad ≈ learned_model.rho * grad_at_rho
+
+    projection_correction = learned_projection_correction(
         learned_model,
         local_gradients,
         problem,
         W,
         problem.x0,
+        2 * learned_model.rho,
     )
-    @test distance_grad ≈ learned_model.rho * grad_at_rho
+    @test projection_correction ≈ distance_grad
 
     step_size = inv(opnorm(single_shooting_cost(problem, problem.x0).H, 2))
     _, initial_grad = grad_cost(problem, problem.x0, U)
     first_W = U - step_size * initial_grad
-    expected_first_U = first_W - learned_squared_distance_gradient(
+    expected_first_U = first_W - learned_projection_correction(
         learned_model,
         local_gradients,
         problem,
         first_W,
         problem.x0,
+        step_size,
     )
+    expected_first_vec = similar(vec(expected_first_U))
+    corrected_prox!(
+        expected_first_vec,
+        constraint(problem, problem.x0; solver = :osqp),
+        vec(expected_first_U),
+        step_size;
+        warm_start = vec(expected_first_U),
+    )
+    expected_first_U = reshape(expected_first_vec, problem.nu, problem.N)
     first_layer = learned_PGM(
         learned_model,
         problem;

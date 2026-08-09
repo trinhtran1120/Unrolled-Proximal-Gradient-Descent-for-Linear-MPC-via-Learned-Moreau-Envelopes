@@ -9,7 +9,6 @@ using LinearAlgebra
 using NPZ
 using OSQP, Gurobi, Ipopt, MosekTools
 using Printf
-using Random
 
 include(joinpath(@__DIR__, "..", "mpc", "problem.jl"))
 include(joinpath(@__DIR__, "..", "utils", "preprocess.jl"))
@@ -24,9 +23,6 @@ tol = 1e-2
 pgm_rho = 0.1
 pgm_adaptive = true
 pgm_max_iter = 1000
-near_zero_env_tol = 1e-12
-near_zero_grad_tol = 1e-10
-zero_to_nonzero_ratio = 0.1
 
 mpc_data = mpc_problem()
 solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
@@ -39,50 +35,24 @@ solve_pgm = PGM_solver(
 )
 cost_func = mpc_data.cost_func
 
-data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
-data_test = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
-
-function downsample_near_zero!(
-    data;
-    env_tol,
-    grad_tol,
-    zero_to_nonzero_ratio,
-    seed = 1234,
+data_train = Dict(
+    "input" => Vector{Float64}[],
+    "env" => Float64[],
+    "grad" => Vector{Float64}[],
+    "q" => Float64[],
+    "r" => Vector{Float64}[],
+    "gamma" => Float64[],
+    "iter" => Int[],
 )
-    sample_count = length(data["env"])
-    informative = [
-        data["env"][i] > env_tol || norm(data["grad"][i], Inf) > grad_tol
-        for i in 1:sample_count
-    ]
-    informative_indices = findall(informative)
-    near_zero_indices = findall(.!informative)
-
-    isempty(informative_indices) && error("No informative training samples were generated")
-
-    max_near_zero = min(
-        length(near_zero_indices),
-        round(Int, zero_to_nonzero_ratio * length(informative_indices)),
-    )
-    rng = MersenneTwister(seed)
-    retained_near_zero = if max_near_zero == 0
-        Int[]
-    else
-        shuffle(rng, near_zero_indices)[1:max_near_zero]
-    end
-    retained_indices = sort!(vcat(informative_indices, retained_near_zero))
-
-    for key in ("input", "env", "grad", "gamma")
-        data[key] = data[key][retained_indices]
-    end
-
-    return (
-        generated = sample_count,
-        informative = length(informative_indices),
-        retained_near_zero = length(retained_near_zero),
-        removed_near_zero = length(near_zero_indices) - length(retained_near_zero),
-        retained = length(retained_indices),
-    )
-end
+data_test = Dict(
+    "input" => Vector{Float64}[],
+    "env" => Float64[],
+    "grad" => Vector{Float64}[],
+    "q" => Float64[],
+    "r" => Vector{Float64}[],
+    "gamma" => Float64[],
+    "iter" => Int[],
+)
 
 function initial_state_feasibility_checker(problem, solver_name)
     model = pick_solver(solver_name)
@@ -110,8 +80,8 @@ is_feasible = initial_state_feasibility_checker(mpc_data, solver_name)
 
 # Split feasible initial states spatially. Nearby grid points generally land in
 # different subsets, while every PGM trajectory remains entirely in one subset.
-x1_grid = -2.0:0.5:3.0
-x2_grid = -2.0:0.5:4.0
+x1_grid = -1.0:0.5:2.0
+x2_grid = -1.0:0.5:1.0
 candidate_points = [
     (ix = ix, iy = iy, x0 = [Float64(x1), Float64(x2)])
     for (ix, x1) in enumerate(x1_grid)
@@ -123,6 +93,7 @@ holdout_states = [[2.0, 0.0], [3.0, 4.0]]
 is_holdout(point) = any(
     isapprox(point.x0, holdout; atol = 1e-12) for holdout in holdout_states
 )
+is_nan_prone_train_point(point) = isapprox(point.x0, [0.0, 0.0]; atol = 1e-12)
 is_spatial_test(point) = mod(point.ix + 2 * point.iy, 7) == 0
 
 test_pool = [
@@ -131,7 +102,7 @@ test_pool = [
 ]
 train_pool = [
     point.x0 for point in feasible_points
-    if !is_holdout(point) && !is_spatial_test(point)
+    if !is_holdout(point) && !is_spatial_test(point) && !is_nan_prone_train_point(point)
 ]
 
 @printf(
@@ -164,27 +135,20 @@ for x0 in train_pool
     @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_U)))
 end
 
-filter_stats = downsample_near_zero!(
-    data_train;
-    env_tol = near_zero_env_tol,
-    grad_tol = near_zero_grad_tol,
-    zero_to_nonzero_ratio = zero_to_nonzero_ratio,
-)
 @printf(
-    "Training samples: %d generated, %d informative, %d near-zero retained, %d near-zero removed, %d total retained\n\n",
-    filter_stats.generated,
-    filter_stats.informative,
-    filter_stats.retained_near_zero,
-    filter_stats.removed_near_zero,
-    filter_stats.retained,
+    "Collected %4d training data points; saving all samples without downsampling\n\n",
+    length(data_train["input"]),
 )
 train_data = Dict(
     "input" => reduce(hcat, data_train["input"]),
-    "grad" => reduce(hcat, data_train["grad"]),
+    "q" => data_train["q"],
+    "r" => reduce(hcat, data_train["r"]),
     "rho_initial" => pgm_rho,
     "adaptive" => pgm_adaptive,
     "gamma" => data_train["gamma"],
     "env" => data_train["env"],
+    "grad" => reduce(hcat, data_train["grad"]),
+    "iter" => data_train["iter"],
     "N" => mpc_data.N,
     "nx" => mpc_data.nx,
     "nu" => mpc_data.nu,
@@ -211,11 +175,14 @@ end
 @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
 test_data = Dict(
     "input" => reduce(hcat, data_test["input"]),
-    "grad" => reduce(hcat, data_test["grad"]),
+    "q" => data_test["q"],
+    "r" => reduce(hcat, data_test["r"]),
     "rho_initial" => pgm_rho,
     "adaptive" => pgm_adaptive,
     "gamma" => data_test["gamma"],
     "env" => data_test["env"],
+    "grad" => reduce(hcat, data_test["grad"]),
+    "iter" => data_test["iter"],
     "N" => mpc_data.N,
     "nx" => mpc_data.nx,
     "nu" => mpc_data.nu,

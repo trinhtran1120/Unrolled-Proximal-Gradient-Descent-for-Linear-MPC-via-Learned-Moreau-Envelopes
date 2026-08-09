@@ -1,4 +1,4 @@
-"""Train and export the linear-MPC Moreau-envelope ICNN model."""
+"""Train and export the linear-MPC squared-distance ICNN model."""
 
 from __future__ import annotations
 
@@ -16,11 +16,12 @@ PROJECT_DIR = SCRIPT_DIR.parents[1]
 DATA_DIR = PROJECT_DIR / "data"
 MODEL_DIR = PROJECT_DIR / "model"
 
-TRAIN_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-train.npz"
-TEST_DATA_PATH = DATA_DIR / "PGM-rho=0.1_nx=2_N=10-test.npz"
-MODEL_PATH = MODEL_DIR / "linear-mpc-icnn-rho=0.1-moreau-conditional"
+RHO_TAG = "0.1"
+TRAIN_DATA_PATH = DATA_DIR / f"PGM-rho={RHO_TAG}_nx=2_N=10-train.npz"
+TEST_DATA_PATH = DATA_DIR / f"PGM-rho={RHO_TAG}_nx=2_N=10-test.npz"
+MODEL_PATH = MODEL_DIR / f"linear-mpc-icnn-rho={RHO_TAG}-distance"
 
-WIDTHS = [32, 32]
+WIDTHS = [64, 64]
 LEARNING_RATE = 1e-3
 GRAD_WEIGHT = 5.0
 L2_REG = 0.0
@@ -29,9 +30,7 @@ EPOCHS = 5000
 SEED = 0
 NORMALIZATION_EPS = 1e-8
 SCALE_DATA = True
-TARGET_MODE = "moreau_envelope"
-GAMMA_FEATURE = "gamma"
-WEIGHT_MODE = "gamma_squared"
+TARGET_MODE = "half_squared_distance"
 
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
@@ -46,19 +45,20 @@ from icnn import (
 
 
 def load_dataset(path: Path):
-    """Load Moreau-envelope data with the requested supervised target."""
+    """Load Moreau-envelope data and convert it to squared distance labels."""
     with np.load(path) as data:
         X = data["input"].T
-        env = data["env"]
-        env_grad = data["grad"].T
 
+        rho_key = "rho_initial" if "rho_initial" in data else "rho"
+        rho = float(np.asarray(data[rho_key]).item())
+        if not np.isfinite(rho) or rho <= 0.0:
+            raise ValueError(f"rho must be finite and strictly positive, got {rho}")
+
+        adaptive = bool(np.asarray(data["adaptive"]).item()) if "adaptive" in data else False
         if "gamma" not in data:
-            raise KeyError(
-                f"{path} does not contain gamma; regenerate the dataset with "
-                "adaptive PGM logging before training this model."
-            )
+            raise KeyError(f"{path} does not contain gamma values for distance conversion")
 
-        gamma = np.asarray(data["gamma"], dtype=float).reshape(-1, 1)
+        gamma = np.asarray(data["gamma"], dtype=float).reshape(-1)
         if gamma.shape[0] != X.shape[0]:
             raise ValueError(
                 "gamma must contain one value per sample: "
@@ -67,37 +67,34 @@ def load_dataset(path: Path):
         if not np.all(np.isfinite(gamma)) or np.any(gamma <= 0.0):
             raise ValueError("gamma values must be finite and strictly positive")
 
-        rho_key = "rho_initial" if "rho_initial" in data else "rho"
-        adaptive = bool(np.asarray(data["adaptive"]).item()) if "adaptive" in data else False
         metadata = {
-            "rho_initial": float(data[rho_key]),
-            "rho_default": float(np.median(gamma)),
+            "rho_initial": rho,
+            "rho": float(np.median(gamma)),
             "adaptive": adaptive,
             "gamma_min": float(np.min(gamma)),
             "gamma_median": float(np.median(gamma)),
             "gamma_mean": float(np.mean(gamma)),
             "gamma_max": float(np.max(gamma)),
         }
-        if TARGET_MODE == "half_squared_distance":
-            y = gamma[:, 0] * env
-            g = gamma * env_grad
-        elif TARGET_MODE == "moreau_envelope":
-            X = np.hstack([X, gamma])
-            y = env
-            g = env_grad
+        if "q" in data and "r" in data:
+            y = np.asarray(data["q"], dtype=float)
+            g = np.asarray(data["r"], dtype=float).T
         else:
-            raise ValueError(f"Unsupported TARGET_MODE: {TARGET_MODE}")
+            env = np.asarray(data["env"], dtype=float)
+            env_grad = np.asarray(data["grad"], dtype=float).T
+            y = gamma * env
+            g = gamma[:, None] * env_grad
 
-        if WEIGHT_MODE == "none":
-            w = np.ones(X.shape[0])
-        elif WEIGHT_MODE == "gamma":
-            w = gamma[:, 0]
-        elif WEIGHT_MODE == "gamma_squared":
-            w = gamma[:, 0] ** 2
-        else:
-            raise ValueError(f"Unsupported WEIGHT_MODE: {WEIGHT_MODE}")
+        if y.shape != (X.shape[0],):
+            raise ValueError(f"q/value labels must have shape ({X.shape[0]},), got {y.shape}")
+        if g.ndim != 2 or g.shape[0] != X.shape[0]:
+            raise ValueError(
+                "r/gradient labels must have one row per sample: "
+                f"got {g.shape} for {X.shape[0]} samples"
+            )
+        w = np.ones(X.shape[0])
 
-        metadata["weight_mode"] = WEIGHT_MODE
+        metadata["weight_mode"] = "none"
         metadata["weight_min"] = float(np.min(w))
         metadata["weight_mean"] = float(np.mean(w))
         metadata["weight_max"] = float(np.max(w))
@@ -180,10 +177,10 @@ def evaluate(params, Xva, yva, gva, normalization):
 
 def prepare_for_export(params, metadata, normalization):
     """Apply nonnegative ICNN projections expected by the Julia model loader."""
-    params["rho"] = metadata["rho_default"]
+    params["rho"] = metadata["rho"]
     params["rho_initial"] = metadata["rho_initial"]
     params["adaptive_data"] = metadata["adaptive"]
-    params["gamma_feature"] = GAMMA_FEATURE if TARGET_MODE == "moreau_envelope" else "none"
+    params["gamma_feature"] = "none"
     params["gamma_stats"] = {
         "min": metadata["gamma_min"],
         "median": metadata["gamma_median"],
@@ -219,16 +216,27 @@ if __name__ == "__main__":
 
     Xtr, ytr, gtr, wtr, train_metadata = load_dataset(TRAIN_DATA_PATH)
     Xva, yva, gva, wva, test_metadata = load_dataset(TEST_DATA_PATH)
+    if not np.isclose(
+        train_metadata["rho_initial"],
+        test_metadata["rho_initial"],
+        rtol=1e-8,
+        atol=1e-12,
+    ):
+        raise ValueError(
+            "train and test datasets must use the same initial rho: "
+            f"{train_metadata['rho_initial']} vs {test_metadata['rho_initial']}"
+        )
 
     n_features, n_samples = Xtr.shape[1], Xtr.shape[0]
     print(f"Number of data: {n_samples}")
     print(f"Input dimension: {n_features}")
     print(f"Gradient target dimension: {gtr.shape[1]}")
     print(f"Target: {TARGET_MODE}")
-    print(f"Gamma feature: {GAMMA_FEATURE if TARGET_MODE == 'moreau_envelope' else 'none'}")
-    print(f"Weight mode: {WEIGHT_MODE}")
+    print("Gamma feature: none")
+    print("Weight mode: none")
     print(f"Adaptive data: {train_metadata['adaptive']}")
     print(f"rho initial: {train_metadata['rho_initial']:.4e}")
+    print(f"export default rho: {train_metadata['rho']:.4e}")
     print(
         "gamma train min/median/mean/max: "
         f"{train_metadata['gamma_min']:.4e} / "
@@ -243,7 +251,6 @@ if __name__ == "__main__":
         f"{test_metadata['gamma_mean']:.4e} / "
         f"{test_metadata['gamma_max']:.4e}"
     )
-    print(f"Export default rho: {train_metadata['rho_default']:.4e}")
     print(
         "weight train min/mean/max: "
         f"{train_metadata['weight_min']:.4e} / "
