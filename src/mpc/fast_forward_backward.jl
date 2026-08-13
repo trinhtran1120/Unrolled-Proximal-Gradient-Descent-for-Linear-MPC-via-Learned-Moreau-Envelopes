@@ -133,16 +133,27 @@ Base.@kwdef mutable struct FastForwardBackwardState{R,Tx,Textr}
     res::Tx           # fixed-point residual at iterate (= z - x)
     z_prev::Tx = copy(x)
     extrapolation_sequence::Textr
+
+    forward_time::Float64 = 0.0
+    backward_time::Float64 = 0.0
+    forward_calls::Int = 0
+    backward_calls::Int = 0
 end
 
 function Base.iterate(iter::FastForwardBackwardIteration)
     x = copy(iter.x0)
+    t_forward = time()
     f_x, grad_f_x = ProximalAlgorithms.value_and_gradient(iter.f, x)
     gamma =
         iter.gamma === nothing ?
         1 / lower_bound_smoothness_constant(iter.f, I, x, grad_f_x) : iter.gamma
     y = x - gamma .* grad_f_x
+    forward_time = time() - t_forward
+
+    t_backward = time()
     z, g_z = prox(iter.g, y, gamma)
+    backward_time = time() - t_backward
+
     state = FastForwardBackwardState(
         x = x,
         f_x = f_x,
@@ -157,6 +168,10 @@ function Base.iterate(iter::FastForwardBackwardIteration)
         else
             AdaptiveNesterovSequence(iter.mf)
         end,
+        forward_time = forward_time,
+        backward_time = backward_time,
+        forward_calls = 1,
+        backward_calls = 1,
     )
     return state, state
 end
@@ -200,10 +215,18 @@ function Base.iterate(
     state.x .= state.z .+ beta .* (state.z .- state.z_prev)
     state.z_prev, state.z = state.z, state.z_prev
 
+    t_forward = time()
     state.f_x, grad_f_x = ProximalAlgorithms.value_and_gradient(iter.f, state.x)
     state.grad_f_x .= grad_f_x
     state.y .= state.x .- state.gamma .* state.grad_f_x
+    state.forward_time += time() - t_forward
+    state.forward_calls += 1
+
+    t_backward = time()
     state.g_z = prox!(state.z, iter.g, state.y, state.gamma)
+    state.backward_time += time() - t_backward
+    state.backward_calls += 1
+
     state.res .= state.x .- state.z
 
     return state, state
@@ -215,8 +238,8 @@ default_stopping_criterion(
     state::FastForwardBackwardState,
 ) = norm(state.res, Inf) / state.gamma <= tol
 default_solution(::FastForwardBackwardIteration, state::FastForwardBackwardState) = state.z
-default_display(it, ::FastForwardBackwardIteration, state::FastForwardBackwardState) =
-    @printf("%5d | %.3e | %.3e\n", it, state.gamma, norm(state.res, Inf) / state.gamma)
+# default_display(it, ::FastForwardBackwardIteration, state::FastForwardBackwardState) =
+#     @printf("%5d | %.3e | %.3e\n", it, state.gamma, norm(state.res, Inf) / state.gamma)
 
 """
     FastForwardBackward(; <keyword-arguments>)
