@@ -21,8 +21,8 @@ mkpath(DATASET_DIR)
 
 solver_name = "OSQP"
 tol = 1e-2
-pgm_rho = 0.1
-pgm_adaptive = true
+pgm_rho = 0.001
+pgm_adaptive = false
 pgm_max_iter = 1000
 near_zero_env_tol = 1e-12
 near_zero_grad_tol = 1e-10
@@ -195,32 +195,32 @@ npzwrite(
 )
 
 
-## test data generation
-for x0 in test_pool
-    println("================ Collecting testing data with initial state = $x0 ================")
+# ## test data generation
+# for x0 in test_pool
+#     println("================ Collecting testing data with initial state = $x0 ================")
 
-    pgm_U, pgm_X, _ = solve_pgm(
-        x0;
-        data = data_test,
-        verbose = true,
-    )
-    J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
-    @printf("J_PGM = %8.4f\n", J_PGM)
-end
+#     pgm_U, pgm_X, _ = solve_pgm(
+#         x0;
+#         data = data_test,
+#         verbose = true,
+#     )
+#     J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
+#     @printf("J_PGM = %8.4f\n", J_PGM)
+# end
 
-@printf("Collected %4d testing data points\n\n", length(data_test["input"]))
-test_data = Dict(
-    "input" => reduce(hcat, data_test["input"]),
-    "grad" => reduce(hcat, data_test["grad"]),
-    "rho_initial" => pgm_rho,
-    "adaptive" => pgm_adaptive,
-    "gamma" => data_test["gamma"],
-    "env" => data_test["env"],
-    "N" => mpc_data.N,
-    "nx" => mpc_data.nx,
-    "nu" => mpc_data.nu,
-)
-npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test.npz"),
-    test_data,
-)
+# @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
+# test_data = Dict(
+#     "input" => reduce(hcat, data_test["input"]),
+#     "grad" => reduce(hcat, data_test["grad"]),
+#     "rho_initial" => pgm_rho,
+#     "adaptive" => pgm_adaptive,
+#     "gamma" => data_test["gamma"],
+#     "env" => data_test["env"],
+#     "N" => mpc_data.N,
+#     "nx" => mpc_data.nx,
+#     "nu" => mpc_data.nu,
+# )
+# npzwrite(
+#     joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test.npz"),
+#     test_data,
+# )

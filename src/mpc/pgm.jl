@@ -111,14 +111,6 @@ function PGM_solver(
     max_iter::Int=1000,
     tol::Float64=1e-3,
 )
-    if !isfinite(rho) || rho <= 0
-        throw(ArgumentError("rho must be finite and strictly positive, got $rho"))
-    end
-    if minimum_gamma <= 0 || reduce_gamma <= 0 || reduce_gamma >= 1 || increase_gamma < 1
-        throw(ArgumentError(
-            "expected minimum_gamma > 0, 0 < reduce_gamma < 1, and increase_gamma >= 1",
-        ))
-    end
 
     nu = problem.nu
     N = problem.N
