@@ -21,8 +21,8 @@ mkpath(DATASET_DIR)
 
 solver_name = "OSQP"
 tol = 1e-2
-pgm_rho = 0.002
-pgm_adaptive = false
+pgm_rho = 0.001
+pgm_adaptive = true
 pgm_max_iter = 1000
 near_zero_env_tol = 1e-12
 near_zero_grad_tol = 1e-10
@@ -123,15 +123,16 @@ holdout_states = [[2.0, 0.0], [3.0, 4.0]]
 is_holdout(point) = any(
     isapprox(point.x0, holdout; atol = 1e-12) for holdout in holdout_states
 )
+is_zero_state(point) = isapprox(point.x0, [0.0, 0.0]; atol = 1e-12)
 is_spatial_test(point) = mod(point.ix + 2 * point.iy, 7) == 0
 
 test_pool = [
     point.x0 for point in feasible_points
-    if is_holdout(point) || is_spatial_test(point)
+    if !is_zero_state(point) && (is_holdout(point) || is_spatial_test(point))
 ]
 train_pool = [
     point.x0 for point in feasible_points
-    if !is_holdout(point) && !is_spatial_test(point)
+    if !is_zero_state(point) && !is_holdout(point) && !is_spatial_test(point)
 ]
 
 @printf(
@@ -158,9 +159,16 @@ for x0 in train_pool
         verbose = true,
     )
     J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
+    delta_J = abs(J_opt - J_PGM)
+    relative_delta_J = if abs(J_opt) <= eps(Float64)
+        delta_J <= eps(Float64) ? 0.0 : Inf
+    else
+        delta_J / abs(J_opt) * 100
+    end
 
     @printf("J_PGM = %8.4f\n", J_PGM)
-    @printf("Delta J/J = %8.4f%%\n", abs(J_opt - J_PGM) / abs(J_opt) * 100)
+    @printf("Delta J = %8.4e\n", delta_J)
+    @printf("Delta J/J = %8.4f%%\n", relative_delta_J)
     @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_U)))
 end
 
@@ -190,7 +198,7 @@ train_data = Dict(
     "nu" => mpc_data.nu,
 )
 npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_fix.npz"),
+    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_adaptive.npz"),
     train_data,
 )
 
@@ -221,6 +229,6 @@ test_data = Dict(
     "nu" => mpc_data.nu,
 )
 npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_fix.npz"),
+    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_adaptive.npz"),
     test_data,
 )

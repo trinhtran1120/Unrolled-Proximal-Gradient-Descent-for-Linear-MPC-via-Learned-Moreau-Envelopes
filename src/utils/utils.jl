@@ -1,329 +1,209 @@
-include(joinpath(@__DIR__, "matrix_tools.jl"))
-
-using Base.Threads
 using JSON3
 using LinearAlgebra
-using SparseArrays
 
-struct LearnedICNN
-    U::Vector{Matrix{Float64}}
-    W::Vector{Matrix{Float64}}
-    b::Vector{Vector{Float64}}
-    v::Vector{Float64}
-    a::Vector{Float64}
-    c::Float64
+
+struct LearnedPCF
+    W_psi::Vector{Matrix{Float64}}
+    V_psi::Vector{Matrix{Float64}}
+    omega_psi::Vector{Vector{Float64}}
+    psi_matrices::Vector{Matrix{Float64}}
+    psi_biases::Vector{Vector{Float64}}
+    shapes::Vector{Vector{Int}}
+    convex_widths::Vector{Int}
+    q_dim::Int
+    theta_dim::Int
     rho::Float64
-    input_mean::Vector{Float64}
-    input_std::Vector{Float64}
+    q_mean::Vector{Float64}
+    q_std::Vector{Float64}
+    theta_mean::Vector{Float64}
+    theta_std::Vector{Float64}
     env_scale::Float64
     target::String
-    gamma_feature::String
 end
+
 
 softplus(x) = log1p(exp(-abs(x))) + max(x, zero(x))
 sigmoid(x) = x >= 0 ? inv(1 + exp(-x)) : exp(x) / (1 + exp(x))
+
 
 function json_matrix(value)
     return Float64.(reduce(hcat, value)')
 end
 
+
 function json_vector(value)
     return Float64.(collect(value))
 end
 
-function load_learned_icnn(path::AbstractString)
+
+function json_int_vector(value)
+    return Int.(collect(value))
+end
+
+
+function load_learned_pcf(path::AbstractString)
     data = JSON3.read(read(path, String))
-    input_dim = length(data["a"])
-    target = haskey(data, :target) ? String(data["target"]) : "half_squared_distance"
-    gamma_feature = haskey(data, :gamma_feature) ? String(data["gamma_feature"]) : "none"
+    normalization = data["normalization"]
+    hyper = data["hyper"]
 
-    if haskey(data, :normalization)
-        normalization = data["normalization"]
-        input_mean = json_vector(normalization["input_mean"])
-        input_std = json_vector(normalization["input_std"])
-        env_scale = Float64(normalization["env_scale"])
-    else
-        input_mean = zeros(Float64, input_dim)
-        input_std = ones(Float64, input_dim)
-        env_scale = 1.0
-    end
+    has_skip_psi = haskey(hyper, :W_psi) && haskey(hyper, :V_psi) && haskey(hyper, :omega_psi)
+    W_psi = has_skip_psi ? [json_matrix(layer) for layer in hyper[:W_psi]] : Matrix{Float64}[]
+    V_psi = has_skip_psi ? [json_matrix(layer) for layer in hyper[:V_psi]] : Matrix{Float64}[]
+    omega_psi = has_skip_psi ? [json_vector(layer) for layer in hyper[:omega_psi]] : Vector{Float64}[]
 
-    return LearnedICNN(
-        [json_matrix(layer) for layer in data["U"]],
-        [json_matrix(layer) for layer in data["W"]],
-        [json_vector(layer) for layer in data["b"]],
-        json_vector(data["v"]),
-        json_vector(data["a"]),
-        Float64(data["c"]),
+    psi_matrix_key = haskey(hyper, :psi_matrices) ? :psi_matrices : :a
+    psi_bias_key = haskey(hyper, :psi_biases) ? :psi_biases : :b
+    psi_matrices = has_skip_psi ? Matrix{Float64}[] : [json_matrix(layer) for layer in hyper[psi_matrix_key]]
+    psi_biases = has_skip_psi ? Vector{Float64}[] : [json_vector(layer) for layer in hyper[psi_bias_key]]
+
+    return LearnedPCF(
+        W_psi,
+        V_psi,
+        omega_psi,
+        psi_matrices,
+        psi_biases,
+        [json_int_vector(shape) for shape in data["shapes"]],
+        json_int_vector(data["convex_widths"]),
+        Int(data["q_dim"]),
+        Int(data["theta_dim"]),
         Float64(data["rho"]),
-        input_mean,
-        input_std,
-        env_scale,
-        target,
-        gamma_feature,
+        json_vector(normalization["q_mean"]),
+        json_vector(normalization["q_std"]),
+        json_vector(normalization["theta_mean"]),
+        json_vector(normalization["theta_std"]),
+        Float64(normalization["env_scale"]),
+        String(data["target"]),
     )
 end
 
-function learned_value(model::LearnedICNN, input::AbstractVector)
-    normalized_input = (input .- model.input_mean) ./ model.input_std
-    z = softplus.(model.U[1] * normalized_input .+ model.b[1])
 
-    for layer_index in 2:length(model.U)
-        z = softplus.(
-            model.W[layer_index] * z .+
-            model.U[layer_index] * normalized_input .+
-            model.b[layer_index]
+function pcf_hyper_forward(model::LearnedPCF, theta::AbstractVector)
+    if !isempty(model.V_psi)
+        out = model.V_psi[1] * theta .+ model.omega_psi[1]
+        for layer_index in 2:length(model.V_psi)
+            out = max.(0.0, out)
+            out = (
+                model.W_psi[layer_index - 1] * out
+                .+ model.V_psi[layer_index] * theta
+                .+ model.omega_psi[layer_index]
+            )
+        end
+        return out
+    end
+
+    h = Vector{Float64}(theta)
+    for layer_index in 1:length(model.psi_matrices)-1
+        h = max.(
+            0.0,
+            model.psi_matrices[layer_index] * h .+ model.psi_biases[layer_index],
         )
     end
-
-    raw_output = dot(model.v, z) + dot(model.a, normalized_input) + model.c
-    return model.env_scale * softplus(raw_output)
+    return model.psi_matrices[end] * h .+ model.psi_biases[end]
 end
 
-function squared_distance_value(model::LearnedICNN, input::AbstractVector)
-    if model.target != "half_squared_distance"
-        throw(ArgumentError("squared_distance_value requires target=half_squared_distance"))
-    end
-    return learned_value(model, input)
+
+function take_row_major_matrix(emitted::AbstractVector, offset::Int, rows::Int, cols::Int)
+    last_index = offset + rows * cols - 1
+    values = @view emitted[offset:last_index]
+    return copy(reshape(values, cols, rows)')
 end
 
-function learned_model_input(model::LearnedICNN, input::AbstractVector, gamma::Real)
-    if model.target == "moreau_envelope"
-        if model.gamma_feature != "gamma"
-            throw(ArgumentError("unsupported gamma feature $(model.gamma_feature)"))
+
+function take_vector(emitted::AbstractVector, offset::Int, len::Int)
+    last_index = offset + len - 1
+    return collect(@view emitted[offset:last_index])
+end
+
+
+function unpack_pcf_weights(model::LearnedPCF, emitted::AbstractVector)
+    offset = 1
+    shape_idx = 1
+    W = Matrix{Float64}[]
+    V = Matrix{Float64}[]
+    omega = Vector{Float64}[]
+
+    for layer_idx in 1:length(model.convex_widths)
+        if layer_idx > 1
+            shape = model.shapes[shape_idx]
+            push!(W, take_row_major_matrix(emitted, offset, shape[1], shape[2]))
+            offset += prod(shape)
+            shape_idx += 1
         end
-        return vcat(input, gamma)
+
+        shape = model.shapes[shape_idx]
+        push!(V, take_row_major_matrix(emitted, offset, shape[1], shape[2]))
+        offset += prod(shape)
+        shape_idx += 1
+
+        shape = model.shapes[shape_idx]
+        push!(omega, take_vector(emitted, offset, shape[1]))
+        offset += prod(shape)
+        shape_idx += 1
     end
-    return input
+
+    shape = model.shapes[shape_idx]
+    W_out = take_row_major_matrix(emitted, offset, shape[1], shape[2])
+    offset += prod(shape)
+    shape_idx += 1
+
+    shape = model.shapes[shape_idx]
+    V_out = take_row_major_matrix(emitted, offset, shape[1], shape[2])
+    offset += prod(shape)
+    shape_idx += 1
+
+    shape = model.shapes[shape_idx]
+    omega_out = take_vector(emitted, offset, shape[1])
+
+    return (W = W, V = V, omega = omega, W_out = W_out, V_out = V_out, omega_out = omega_out)
 end
 
-function moreau_envelope(
-    model::LearnedICNN,
-    input::AbstractVector,
-    gamma::Real,
+
+function pcf_value_and_grad_normalized(
+    model::LearnedPCF,
+    q_norm::AbstractVector,
+    theta_norm::AbstractVector,
 )
-    if !isfinite(gamma) || gamma <= 0
-        throw(ArgumentError("gamma must be finite and strictly positive, got $gamma"))
+    weights = unpack_pcf_weights(model, pcf_hyper_forward(model, theta_norm))
+
+    pre = weights.V[1] * q_norm .+ weights.omega[1]
+    z = softplus.(pre)
+    dz_dq = Diagonal(sigmoid.(pre)) * weights.V[1]
+
+    for layer_idx in 2:length(weights.V)
+        W_pos = softplus.(weights.W[layer_idx - 1])
+        pre = W_pos * z .+ weights.V[layer_idx] * q_norm .+ weights.omega[layer_idx]
+        dpre_dq = W_pos * dz_dq .+ weights.V[layer_idx]
+        z = softplus.(pre)
+        dz_dq = Diagonal(sigmoid.(pre)) * dpre_dq
     end
-    if model.target == "half_squared_distance"
-        return squared_distance_value(model, input) / gamma
-    elseif model.target == "moreau_envelope"
-        return learned_value(model, learned_model_input(model, input, gamma))
-    end
-    throw(ArgumentError("unsupported learned ICNN target $(model.target)"))
+
+    W_out = vec(softplus.(weights.W_out[1, :]))
+    value = dot(W_out, z) + dot(vec(weights.V_out[1, :]), q_norm) + weights.omega_out[1]
+    grad_q = W_out' * dz_dq .+ vec(weights.V_out[1, :])'
+    return value, vec(grad_q)
 end
 
-function learned_value_full_gradient(
-    model::LearnedICNN,
-    local_gradients::NTuple,
-    input::AbstractVector,
-)
-    normalized_input = (input .- model.input_mean) ./ model.input_std
-    input_batch = reshape(normalized_input, :, 1)
 
-    raw_output = local_gradients[1].m(input_batch)
-    raw_gradient = mini_batch(local_gradients, input_batch; batch_size = 1)
-    full_gradient = vec(
-        model.env_scale .* sigmoid.(raw_output) .* raw_gradient ./
-        reshape(model.input_std, :, 1)
-    )
-
-    return full_gradient
+function moreau_envelope(model::LearnedPCF, input::AbstractVector, rho_backward::Real)
+    q = input[1:model.q_dim]
+    theta = input[model.q_dim+1:model.q_dim+model.theta_dim]
+    q_norm = (q .- model.q_mean) ./ model.q_std
+    theta_norm = (theta .- model.theta_mean) ./ model.theta_std
+    value_norm, _ = pcf_value_and_grad_normalized(model, q_norm, theta_norm)
+    return model.env_scale * value_norm
 end
 
-function learned_squared_distance_full_gradient(
-    model::LearnedICNN,
-    local_gradients::NTuple,
-    input::AbstractVector,
-)
-    if model.target != "half_squared_distance"
-        throw(ArgumentError("squared-distance gradient requires target=half_squared_distance"))
-    end
-    return learned_value_full_gradient(model, local_gradients, input)
-end
 
 function learned_moreau_full_gradient(
-    model::LearnedICNN,
-    local_gradients::NTuple,
+    model::LearnedPCF,
     input::AbstractVector,
-    gamma::Real,
+    rho_backward::Real,
 )
-    if !isfinite(gamma) || gamma <= 0
-        throw(ArgumentError("gamma must be finite and strictly positive, got $gamma"))
-    end
-    if model.target == "half_squared_distance"
-        return learned_squared_distance_full_gradient(model, local_gradients, input) / gamma
-    elseif model.target == "moreau_envelope"
-        return learned_value_full_gradient(
-            model,
-            local_gradients,
-            learned_model_input(model, input, gamma),
-        )
-    end
-    throw(ArgumentError("unsupported learned ICNN target $(model.target)"))
+    q = input[1:model.q_dim]
+    theta = input[model.q_dim+1:model.q_dim+model.theta_dim]
+    q_norm = (q .- model.q_mean) ./ model.q_std
+    theta_norm = (theta .- model.theta_mean) ./ model.theta_std
+    _, grad_q_norm = pcf_value_and_grad_normalized(model, q_norm, theta_norm)
+    grad_q = grad_q_norm .* model.env_scale ./ model.q_std
+    return vcat(grad_q, zeros(Float64, model.theta_dim))
 end
-
-
-function icnn_from_learned(model::LearnedICNN)
-    layers = [
-        ICNN_Layer(model.U[layer_index], model.W[layer_index], model.b[layer_index])
-        for layer_index in 2:length(model.U)
-    ]
-
-    return ICNN(model.U[1], model.b[1], layers, model.v, model.a, model.c)
-end
-
-function load_model(fname::String)
-    data   = JSON3.read(read(fname, String))
-    vecf64 = (Vector{Float64} ∘ vec)
-    model = (
-        U = convert_to_matrix.(data["U"]),
-        W = convert_to_matrix.(data["W"]),
-        a = vecf64(data["a"]), 
-        b = vecf64.(data["b"]),
-        c = Float64(data["c"]),
-        v = vecf64(data["v"])
-    )
-    return Float64(data["rho"]), model
-end
-
-function convert_to_matrix(L)
-    v = copy(hcat(L...)')
-    isempty(v) ? Float64[] : v
-end
-
-
-struct ICNN_Layer
-    U::Matrix{Float64}
-    W::Matrix{Float64}
-    b::Vector{Float64}
-end
-
-@inbounds function (m::ICNN_Layer)(x::Matrix{Float64}, z::Matrix{Float64})
-    s = m.W * z + m.U * x .+ m.b
-    return map(softplus, s), s  # convex & nondecreasing
-end
-
-
-struct ICNN
-    U0::Matrix{Float64}
-    b0::Vector{Float64}
-    layers::Vector{ICNN_Layer}
-    v::Vector{Float64}
-    a::Vector{Float64}
-    c::Float64
-end
-
-@inbounds function (m::ICNN)(x::Matrix{Float64})::Matrix{Float64}
-    z = softplus.(m.U0 * x .+ m.b0)  # first layer (no state W)
-    for layer in m.layers
-        z, _ = layer(x, z)
-    end
-    return m.v' * z .+ m.a' * x .+ m.c
-end
-
-mutable struct gradient_struct
-    lenlay::Int
-    m::ICNN
-    s_store::NTuple
-    σ_store::NTuple 
-    z_store::NTuple
-
-    init_grad_x::Matrix{Float64}
-    init_dL_dz::Matrix{Float64}  
-    grad_x_buf::Matrix{Float64} 
-    dL_curr::Matrix{Float64}
-    dL_next::Matrix{Float64}
-end
-
-function gradient_struct(m::ICNN, nbatch::Int, dim::Int)
-
-    U0     = m.U0
-    layers = m.layers
-    lenlay = length(layers)
-
-    layer_rows = hcat(size(U0, 1), [size(layer.W, 1) for layer in layers])
-    store_len  = length(layer_rows)
-
-    s_store     = ntuple(i -> zeros(Float64, layer_rows[i], nbatch), store_len)
-    σ_store     = ntuple(i -> zeros(Float64, layer_rows[i], nbatch), store_len)
-    z_store     = ntuple(i -> zeros(Float64, layer_rows[i], nbatch), store_len)
-    init_grad_x = repeat(m.a, 1, nbatch)
-    init_dL_dz  = repeat(m.v, 1, nbatch)
-
-    grad_x_buf  = zeros(Float64, dim, nbatch)
-    dL_curr     = zeros(Float64, size(m.v, 1), nbatch)
-    dL_next     = zeros(Float64, size(m.v, 1), nbatch)
-
-    return gradient_struct(lenlay, m, s_store, σ_store, z_store, init_grad_x, init_dL_dz, grad_x_buf, dL_curr, dL_next)
-end
-precompile(gradient_struct, (ICNN, Int, Int))
-
-
-@inbounds function mini_batch(
-    local_gradients::NTuple,
-    batch::AbstractMatrix;
-    batch_size::Int = size(batch, 2),
-)
-    data_size = size(batch, 2)
-    n_mb      = div(data_size - 1, batch_size) + 1
-
-    if length(local_gradients) < n_mb
-        throw(ArgumentError("local_gradients must contain at least $n_mb gradient evaluators"))
-    end
-
-    out       = copy(batch)
-
-    @threads for i in 1:n_mb
-        col_start = (i - 1) * batch_size + 1
-        col_stop = min(i * batch_size, data_size)
-        @views out[:, col_start:col_stop] .= local_gradients[i](batch[:, col_start:col_stop])
-    end
-    return out
-end
-
-
-function (obj::gradient_struct)(x::AbstractMatrix{Float64})
-
-    s_first = obj.s_store[1]
-    nL = obj.lenlay
-
-    mul!(s_first,      obj.m.U0, x)
-    add_bias!(s_first, obj.m.b0)
-    activation_sigma!(obj.z_store[1], obj.σ_store[1], s_first)
-
-    for i in 1:nL
-        layer  = obj.m.layers[i]
-        s_next = obj.s_store[i+1]
-        z_prev = obj.z_store[i]
-
-        mul!(s_next, layer.W, z_prev)
-        mmul_add_matrix!(s_next, layer.U, x)
-        add_bias!(s_next, layer.b)
-        activation_sigma!(obj.z_store[i+1], obj.σ_store[i+1], s_next)
-    end
-
-    copyto!(obj.dL_curr,    obj.init_dL_dz)
-    copyto!(obj.grad_x_buf, obj.init_grad_x)
-
-    for i in nL:-1:1
-        layer = obj.m.layers[i]
-        dL_ds = obj.σ_store[i+1]
-        hadamard!(dL_ds, obj.dL_curr)
-        mmul_add_matrix!(obj.grad_x_buf, layer.U', dL_ds)
-
-        mul!(obj.dL_next, layer.W', dL_ds)
-        obj.dL_curr, obj.dL_next = obj.dL_next, obj.dL_curr
-    end
-
-    dL_ds_first = obj.σ_store[1]
-    hadamard!(dL_ds_first, obj.dL_curr)
-    mmul_add_matrix!(obj.grad_x_buf, obj.m.U0', dL_ds_first)
-
-    return obj.grad_x_buf
-end
-
-@inline function LU_decomp(x)
-    return lu(x)
-end
-precompile(LU_decomp, (SparseMatrixCSC{Float64, Int64},))
