@@ -159,8 +159,8 @@ function PGM_solver(
                 distance_value = 0.5 * dot(d, d)                # = 0.5 * ||y - P_F(y)||^2
 
                 if data !== nothing 
-                        push!(data["q"], copy(state.y))
-                        push!(data["x0"], copy(x0))
+                        push!(data["input"], copy(state.y))
+                        push!(data["parameter"], copy(x0))
                         push!(data["proj"], copy(state.z))
                         push!(data["env"], distance_value)
                         push!(data["grad"], copy(distance_grad))

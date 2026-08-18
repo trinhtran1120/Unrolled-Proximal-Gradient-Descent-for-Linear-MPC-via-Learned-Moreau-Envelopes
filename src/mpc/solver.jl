@@ -53,3 +53,27 @@ function mpc_solver(name, problem, tol)
 
     return solver
 end
+
+
+
+function initialization(name, problem, tol)
+    model = pick_solver(name, tol)
+    nx, nu, N = problem.nx, problem.nu, problem.N
+
+    @variable(model, problem.xmin <= x[1:nx, 1:N+1] <= problem.xmax)
+    @variable(model, problem.umin <= u[1:nu, 1:N] <= problem.umax)
+    @variable(model, x0[i in 1:nx] in MOI.Parameter(problem.x0[i]))
+
+    @constraint(model, x[:, 1] .== x0)
+    for k in 1:N
+        @constraint(model, x[:, k+1] .== problem.A * x[:, k] + problem.B * u[:, k])
+    end
+    @objective(model, Min, 0.0)
+
+    return function (init)
+        set_parameter_value.(x0, init)
+        optimize!(model)
+        return termination_status(model) == MOI.OPTIMAL &&
+               primal_status(model) == MOI.FEASIBLE_POINT
+    end
+end
