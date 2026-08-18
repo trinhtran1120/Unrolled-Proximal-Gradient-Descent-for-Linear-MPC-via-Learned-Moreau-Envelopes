@@ -135,16 +135,19 @@ function PGM_solver(
         for (iter, state) in enumerate(ffb_iter)
             u_solution .= state.z
 
-            moreau = ProximalOperators.MoreauEnvelope(g, state.gamma)
-            moreau_grad = similar(state.y)
-            moreau_value = ProximalCore.gradient!(moreau_grad, moreau, state.y)
+            # moreau = ProximalOperators.MoreauEnvelope(g, state.gamma)
+            # moreau_grad = similar(state.y)
+            # moreau_value = ProximalCore.gradient!(moreau_grad, moreau, state.y)
+            d = state.y .- state.z                          # = y − Π_F(y)
+            moreau_grad  = d ./ state.gamma
+            moreau_value = dot(d, d) / (2 * state.gamma)
 
             if data !== nothing 
                 # if moreau_value > 1e-6 || rand() < 0.1
                     push!(data["input"], vcat(state.y, x0))
                     push!(data["env"], moreau_value)
                     push!(data["grad"], copy(moreau_grad))
-                    push!(data["gamma"], state.gamma)
+                    # push!(data["gamma"], state.gamma)
                 # end
             end
 

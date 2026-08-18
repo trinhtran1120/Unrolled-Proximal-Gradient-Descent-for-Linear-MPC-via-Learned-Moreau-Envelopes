@@ -28,6 +28,10 @@ near_zero_env_tol = 1e-12
 near_zero_grad_tol = 1e-10
 zero_to_nonzero_ratio = 0.1
 
+# `pgm_rho` is only in force when adaptive = false; with backtracking enabled the
+# step size is chosen by the algorithm, so it is neither recorded nor named.
+mode_tag = pgm_adaptive ? "adaptive" : "fixed"
+
 mpc_data = mpc_problem()
 solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
 solve_pgm = PGM_solver(
@@ -39,8 +43,11 @@ solve_pgm = PGM_solver(
 )
 cost_func = mpc_data.cost_func
 
-data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
-data_test = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[], "gamma" => Float64[])
+# Labels are stored gamma-free (envelope and gradient at gamma = 1): for an
+# indicator, prox_{gamma*g} = Pi_F regardless of gamma, so any other gamma is
+# recovered downstream by dividing. Nothing here depends on the step size.
+data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
+data_test = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
 
 function downsample_near_zero!(
     data;
@@ -71,7 +78,7 @@ function downsample_near_zero!(
     end
     retained_indices = sort!(vcat(informative_indices, retained_near_zero))
 
-    for key in ("input", "env", "grad", "gamma")
+    for key in ("input", "env", "grad")
         data[key] = data[key][retained_indices]
     end
 
@@ -186,19 +193,18 @@ filter_stats = downsample_near_zero!(
     filter_stats.removed_near_zero,
     filter_stats.retained,
 )
-train_data = Dict(
+train_data = Dict{String,Any}(
     "input" => reduce(hcat, data_train["input"]),
     "grad" => reduce(hcat, data_train["grad"]),
-    "rho_initial" => pgm_rho,
     "adaptive" => pgm_adaptive,
-    "gamma" => data_train["gamma"],
     "env" => data_train["env"],
     "N" => mpc_data.N,
     "nx" => mpc_data.nx,
     "nu" => mpc_data.nu,
 )
+pgm_adaptive || (train_data["rho_initial"] = pgm_rho)
 npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_adaptive.npz"),
+    joinpath(DATASET_DIR, "PGM_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
     train_data,
 )
 
@@ -217,18 +223,17 @@ for x0 in test_pool
 end
 
 @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
-test_data = Dict(
+test_data = Dict{String,Any}(
     "input" => reduce(hcat, data_test["input"]),
     "grad" => reduce(hcat, data_test["grad"]),
-    "rho_initial" => pgm_rho,
     "adaptive" => pgm_adaptive,
-    "gamma" => data_test["gamma"],
     "env" => data_test["env"],
     "N" => mpc_data.N,
     "nx" => mpc_data.nx,
     "nu" => mpc_data.nu,
 )
+pgm_adaptive || (test_data["rho_initial"] = pgm_rho)
 npzwrite(
-    joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_adaptive.npz"),
+    joinpath(DATASET_DIR, "PGM_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
     test_data,
 )
