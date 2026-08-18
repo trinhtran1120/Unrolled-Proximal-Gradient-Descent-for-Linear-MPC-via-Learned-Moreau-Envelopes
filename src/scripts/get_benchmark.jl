@@ -23,14 +23,15 @@ const LEARNED_PGM_RHO = 0.01
 const LEARNED_PGM_MINIMUM_RHO = 1e-6
 const LEARNED_PGM_REDUCE_RHO = 0.5
 const LEARNED_PGM_INCREASE_RHO = 1.05
-const LEARNED_PGM_POLISH_ITER = 10
+const LEARNED_PGM_POLISH_ITER = 20
+const EXPECTED_MODEL_THETA_DIM = 2
 
 model_path = joinpath(
     @__DIR__,
     "..",
     "..",
     "model",
-    "linear-mpc-lpcf001-adaptive.json",
+    "linear-mpc-pcf_adaptive.json",
 )
 
 mpc_data = mpc_problem()
@@ -45,6 +46,17 @@ solve_pgm = PGM_solver(
     tol = TOL,
 )
 learned_model = load_learned_pcf(model_path)
+
+if learned_model.theta_dim != EXPECTED_MODEL_THETA_DIM
+    error(
+        "Adaptive benchmark expects a psi(q; x0) model with theta_dim = " *
+        "$EXPECTED_MODEL_THETA_DIM, got $(learned_model.theta_dim). " *
+        "Retrain/export with train_pcf_fix.py after regenerating projection-backed data."
+    )
+end
+if learned_model.output_activation != "squared_relu"
+    @warn "Expected squared_relu output activation for the current LPCF model" learned_model.output_activation
+end
 
 function max_constraint_violation(problem, U, X)
     return max(
@@ -77,6 +89,9 @@ println("learned adaptive PCF-PGM increase rho = $LEARNED_PGM_INCREASE_RHO")
 println("learned PCF-PGM depth = $LEARNED_PGM_MAX_ITER")
 println("exact PGM polish depth = $LEARNED_PGM_POLISH_ITER")
 println("learned model = $model_path")
+println("learned model theta_dim = $(learned_model.theta_dim)")
+println("learned model output activation = $(learned_model.output_activation)")
+println("learned model represents psi(q; x0); adaptive rho scales grad psi by 1/rho")
 println()
 
 println("---------------- $SOLVER_NAME ----------------")

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import pickle
 import sys
+import warnings
 from pathlib import Path
 
 import jax
@@ -16,9 +17,13 @@ project_dir = script_dir.parents[1]
 data_dir = project_dir / "data"
 model_dir = project_dir / "model"
 
-train_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-train_fix.npz"
-test_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-test_fix.npz"
-model_path = model_dir / "linear-mpc-lpcf001-fix"
+train_data_path = data_dir / "PGM_nx=2_N=10-train_adaptive.npz"
+test_data_path = data_dir / "PGM_nx=2_N=10-test_adaptive.npz"
+model_path = model_dir / "linear-mpc-pcf_adaptive"
+
+# The network learns psi(q; x0) = 0.5 * dist_F(x0)(q)^2. The true Moreau
+# envelope for any gamma is phi^gamma = psi / gamma.
+ENVELOPE_GAMMA = 1.0
 
 convex_widths = [16, 16]
 hyper_widths = [64, 64]
@@ -32,39 +37,22 @@ feasibility_weight = 0.0
 l2_reg = 0.0
 batch_size = 128
 epochs = 3000
+eval_interval = 50
 seed = 0
 normalization_eps = 1e-8
 normalize_data = False
-normalize_gamma = False
 normalize_env = True
-adaptive_step_size = False
 
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
-from learning.pcf_fix import (
+from pcf_fix import (
     init_lpcf_params,
     loss_fn,
     train_lpcf,
     to_serializable,
     value_and_grad,
 )
-
-
-def _require_fixed_gamma(path: Path, gamma: np.ndarray) -> float:
-    """return fixed gamma or raise if the dataset is not fixed-gamma."""
-    if gamma.size == 0:
-        raise ValueError(f"{path} contains an empty gamma array")
-
-    gamma_ref = float(gamma[0])
-    if not np.allclose(gamma, gamma_ref, rtol=1e-8, atol=1e-12):
-        raise ValueError(
-            f"{path} contains variable gamma values "
-            f"(min={np.min(gamma):.4e}, max={np.max(gamma):.4e}). "
-            "for the fixed-gamma lpcf experiment, regenerate data with a fixed "
-            "pgm step size or set adaptive_step_size=true knowingly."
-        )
-    return gamma_ref
 
 
 def load_dataset(path: Path):
@@ -76,40 +64,49 @@ def load_dataset(path: Path):
         q_dim = nu * horizon
         x0_dim = nx
 
-        x = np.asarray(data["input"], dtype=float).T
-        expected_input_dim = q_dim + x0_dim
-        if x.shape[1] != expected_input_dim:
-            raise ValueError(
-                f"{path} input has {x.shape[1]} rows after transpose, expected "
-                f"nu*horizon + nx = {q_dim} + {x0_dim} = {expected_input_dim}"
-            )
+        if {"q", "x0", "proj"}.issubset(data.files):
+            q = np.asarray(data["q"], dtype=float).T
+            x0 = np.asarray(data["x0"], dtype=float).T
+            proj = np.asarray(data["proj"], dtype=float).T
+            if q.shape != proj.shape:
+                raise ValueError(f"{path} q and proj must have the same shape")
+            if q.shape[1] != q_dim:
+                raise ValueError(f"{path} q has dimension {q.shape[1]}, expected {q_dim}")
+            if x0.shape != (q.shape[0], x0_dim):
+                raise ValueError(f"{path} x0 must have shape {(q.shape[0], x0_dim)}, got {x0.shape}")
 
-        q = x[:, :q_dim]
-        x0 = x[:, q_dim:]
-        y = np.asarray(data["env"], dtype=float)
-        g = np.asarray(data["grad"], dtype=float).T
+            displacement = q - proj
+            y = 0.5 * np.sum(displacement**2, axis=1)
+            g = displacement
+        else:
+            warnings.warn(
+                f"{path} does not contain q/x0/proj; falling back to legacy "
+                "input/env/grad labels. Regenerate adaptive data for "
+                "projection-backed adaptive targets.",
+                stacklevel=2,
+            )
+            x = np.asarray(data["input"], dtype=float).T
+            expected_input_dim = q_dim + x0_dim
+            if x.shape[1] != expected_input_dim:
+                raise ValueError(
+                    f"{path} input has {x.shape[1]} rows after transpose, expected "
+                    f"nu*horizon + nx = {q_dim} + {x0_dim} = {expected_input_dim}"
+                )
+
+            q = x[:, :q_dim]
+            x0 = x[:, q_dim:]
+            y = np.asarray(data["env"], dtype=float)
+            g = np.asarray(data["grad"], dtype=float).T
         if g.shape != q.shape:
             raise ValueError(f"{path} grad must have shape {q.shape}, got {g.shape}")
 
-        gamma = np.asarray(data["gamma"], dtype=float).reshape(-1)
-        if gamma.shape[0] != q.shape[0]:
-            raise ValueError(
-                f"{path} gamma must contain one value per sample: "
-                f"got {gamma.shape[0]} for {q.shape[0]} samples"
-            )
-        if not np.all(np.isfinite(gamma)) or np.any(gamma <= 0.0):
-            raise ValueError("gamma values must be finite and strictly positive")
-
-        if adaptive_step_size:
-            gamma_fixed = float(np.median(gamma))
-            theta = np.hstack((x0, gamma[:, None]))
-            theta_dim = x0_dim + 1
-        else:
-            gamma_fixed = _require_fixed_gamma(path, gamma)
-            theta = x0
-            theta_dim = x0_dim
-
+        theta = x0
+        theta_dim = x0_dim
         adaptive = bool(np.asarray(data["adaptive"]).item()) if "adaptive" in data else False
+
+        # get_data.jl only records rho_initial for fixed-step-size runs.
+        rho_initial = float(data["rho_initial"]) if "rho_initial" in data else None
+
         metadata = {
             "nx": nx,
             "nu": nu,
@@ -117,15 +114,9 @@ def load_dataset(path: Path):
             "q_dim": q_dim,
             "theta_dim": theta_dim,
             "x0_dim": x0_dim,
-            "rho_initial": float(data["rho_initial"]),
-            "gamma_fixed": gamma_fixed,
-            "gamma_feature": "gamma" if adaptive_step_size else "none",
-            "parameter": "x0_gamma" if adaptive_step_size else "x0",
+            "rho_initial": rho_initial,
+            "parameter": "x0",
             "adaptive_data": adaptive,
-            "gamma_min": float(np.min(gamma)),
-            "gamma_median": float(np.median(gamma)),
-            "gamma_mean": float(np.mean(gamma)),
-            "gamma_max": float(np.max(gamma)),
         }
 
         w = np.ones(q.shape[0])
@@ -158,10 +149,6 @@ def fit_normalization(
         env_scale = float(y.std())
         if env_scale < normalization_eps:
             env_scale = 1.0
-    elif normalize_gamma and adaptive_step_size:
-        gamma_std = float(theta[:, -1].std())
-        theta_mean[-1] = float(theta[:, -1].mean())
-        theta_std[-1] = 1.0 if gamma_std < normalization_eps else gamma_std
 
     if normalize_env and not normalize:
         env_scale = float(y.std())
@@ -244,8 +231,8 @@ def make_feasibility_data(metadata, normalization):
 
     return {
         "weight": feasibility_weight,
-        "gamma": metadata["gamma_fixed"],
-        "gamma_feature": metadata["gamma_feature"],
+        "gamma": ENVELOPE_GAMMA,
+        "gamma_feature": "none",
         "x0_dim": metadata["x0_dim"],
         "g_matrix": g_matrix,
         "b_offset": b_offset,
@@ -303,10 +290,11 @@ def prepare_for_export(params, metadata, normalization):
     params["model_type"] = "lpcf"
     params["target"] = "moreau_envelope"
     params["flatten_order"] = "all_w_all_v_all_omega"
-    params["output_activation"] = params.get("output_activation", "softplus")
-    params["gamma_feature"] = metadata["gamma_feature"]
+    params["output_activation"] = params.get("output_activation", "squared_relu")
     params["parameter"] = metadata["parameter"]
-    params["rho"] = metadata["gamma_fixed"]
+    params["gamma_feature"] = "none"
+    params["envelope_gamma"] = ENVELOPE_GAMMA
+    params["rho"] = ENVELOPE_GAMMA
     params["rho_initial"] = metadata["rho_initial"]
     params["mpc"] = {
         "nx": metadata["nx"],
@@ -315,13 +303,6 @@ def prepare_for_export(params, metadata, normalization):
         "q_dim": metadata["q_dim"],
         "theta_dim": metadata["theta_dim"],
         "x0_dim": metadata["x0_dim"],
-    }
-    params["gamma_stats"] = {
-        "fixed": metadata["gamma_fixed"],
-        "min": metadata["gamma_min"],
-        "median": metadata["gamma_median"],
-        "mean": metadata["gamma_mean"],
-        "max": metadata["gamma_max"],
     }
     params["adaptive_data"] = metadata["adaptive_data"]
     params["normalization"] = normalization
@@ -350,18 +331,10 @@ if __name__ == "__main__":
         f"theta dimension: {train_metadata['theta_dim']} "
         f"({train_metadata['parameter']})"
     )
-    print(f"default gamma: {train_metadata['gamma_fixed']:.4e}")
-    print(f"gamma feature: {train_metadata['gamma_feature']}")
+    print(f"envelope gamma: {ENVELOPE_GAMMA:.4e}")
+    print("gamma feature: none")
     print(f"adaptive data flag: {train_metadata['adaptive_data']}")
-    print(
-        "gamma train min/median/mean/max: "
-        f"{train_metadata['gamma_min']:.4e} / "
-        f"{train_metadata['gamma_median']:.4e} / "
-        f"{train_metadata['gamma_mean']:.4e} / "
-        f"{train_metadata['gamma_max']:.4e}"
-    )
     print(f"normalize data: {normalize_data}")
-    print(f"normalize gamma: {normalize_gamma}")
     print(f"normalize env/grad: {normalize_env}")
     print(f"feasibility weight: {feasibility_weight}")
     print(f"learning rate: {learning_rate}")
@@ -369,6 +342,7 @@ if __name__ == "__main__":
     print(f"value weight: {value_weight}")
     print(f"grad weight: {grad_weight}")
     print(f"selection metric: {selection_metric}")
+    print(f"eval interval: {eval_interval}")
     print(f"seed: {seed}")
 
     normalization = fit_normalization(qtr, thetatr, ytr, normalize_data)
@@ -415,6 +389,7 @@ if __name__ == "__main__":
         l2_reg=l2_reg,
         batch_size=batch_size,
         epochs=epochs,
+        eval_interval=eval_interval,
         q_val=qva_norm,
         theta_val=thetava_norm,
         y_val=yva_norm,
@@ -458,7 +433,7 @@ if __name__ == "__main__":
     val_mse, grad_mse = evaluate(params, qva, thetava, yva, gva, normalization)
     print(f"[test original] value mse: {val_mse:.4e} | grad mse: {grad_mse:.4e}")
 
-    # save_model(
-    #     prepare_for_export(params, train_metadata, normalization),
-    #     model_path,
-    # )
+    save_model(
+        prepare_for_export(params, train_metadata, normalization),
+        model_path,
+    )

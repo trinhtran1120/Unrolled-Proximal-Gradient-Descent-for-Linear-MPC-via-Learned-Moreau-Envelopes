@@ -43,11 +43,23 @@ solve_pgm = PGM_solver(
 )
 cost_func = mpc_data.cost_func
 
-# Labels are stored gamma-free (envelope and gradient at gamma = 1): for an
-# indicator, prox_{gamma*g} = Pi_F regardless of gamma, so any other gamma is
-# recovered downstream by dividing. Nothing here depends on the step size.
-data_train = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
-data_test = Dict("input" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
+# Store the projection itself. For an indicator, prox(g, q, gamma) = Pi_F(q)
+# regardless of gamma; training derives psi = 0.5*||q-proj||^2 and grad psi =
+# q-proj, then Moreau quantities are recovered by scaling with 1/gamma.
+data_train = Dict(
+    "q" => Vector{Float64}[],
+    "x0" => Vector{Float64}[],
+    "proj" => Vector{Float64}[],
+    "env" => Float64[],
+    "grad" => Vector{Float64}[],
+)
+data_test = Dict(
+    "q" => Vector{Float64}[],
+    "x0" => Vector{Float64}[],
+    "proj" => Vector{Float64}[],
+    "env" => Float64[],
+    "grad" => Vector{Float64}[],
+)
 
 function downsample_near_zero!(
     data;
@@ -78,7 +90,7 @@ function downsample_near_zero!(
     end
     retained_indices = sort!(vcat(informative_indices, retained_near_zero))
 
-    for key in ("input", "env", "grad")
+    for key in ("q", "x0", "proj", "env", "grad")
         data[key] = data[key][retained_indices]
     end
 
@@ -194,7 +206,10 @@ filter_stats = downsample_near_zero!(
     filter_stats.retained,
 )
 train_data = Dict{String,Any}(
-    "input" => reduce(hcat, data_train["input"]),
+    "q" => reduce(hcat, data_train["q"]),
+    "x0" => reduce(hcat, data_train["x0"]),
+    "proj" => reduce(hcat, data_train["proj"]),
+    "input" => reduce(hcat, [vcat(q, x0) for (q, x0) in zip(data_train["q"], data_train["x0"])]),
     "grad" => reduce(hcat, data_train["grad"]),
     "adaptive" => pgm_adaptive,
     "env" => data_train["env"],
@@ -222,9 +237,12 @@ for x0 in test_pool
     @printf("J_PGM = %8.4f\n", J_PGM)
 end
 
-@printf("Collected %4d testing data points\n\n", length(data_test["input"]))
+@printf("Collected %4d testing data points\n\n", length(data_test["q"]))
 test_data = Dict{String,Any}(
-    "input" => reduce(hcat, data_test["input"]),
+    "q" => reduce(hcat, data_test["q"]),
+    "x0" => reduce(hcat, data_test["x0"]),
+    "proj" => reduce(hcat, data_test["proj"]),
+    "input" => reduce(hcat, [vcat(q, x0) for (q, x0) in zip(data_test["q"], data_test["x0"])]),
     "grad" => reduce(hcat, data_test["grad"]),
     "adaptive" => pgm_adaptive,
     "env" => data_test["env"],

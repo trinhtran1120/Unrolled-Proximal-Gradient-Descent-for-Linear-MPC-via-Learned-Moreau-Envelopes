@@ -17,8 +17,8 @@ hyper_widths = (64, 64)
 
 
 def MAKE_POSITIVE(x: jnp.ndarray) -> jnp.ndarray:
-    """Project ICNN recurrent weights to the nonnegative orthant."""
-    return jax.nn.relu(x)
+    """Smoothly map ICNN recurrent weights to the nonnegative orthant."""
+    return jax.nn.softplus(x)
 
 
 def activation(x: jnp.ndarray) -> jnp.ndarray:
@@ -27,13 +27,14 @@ def activation(x: jnp.ndarray) -> jnp.ndarray:
 
 
 def output_activation(x: jnp.ndarray) -> jnp.ndarray:
-    """Nonnegative convex output for Moreau-envelope values."""
+    """Convex nondecreasing output shaped like 0.5 * dist(q, F)^2."""
     return jax.nn.softplus(x)
 
 
 def rand_uniform(key: jax.Array, shape: tuple[int, ...]) -> jnp.ndarray:
-    """Match source _rand: entries sampled from [-0.5, 0.5]."""
-    return jax.random.uniform(key, shape, minval=-0.5, maxval=0.5)
+    """Initialize dense parameters with fan-in scaling."""
+    fan_in = shape[-1] if len(shape) > 1 else 1
+    return jax.random.uniform(key, shape, minval=-0.5, maxval=0.5) / np.sqrt(fan_in)
 
 
 def make_sections(q_dim: int, widths: Sequence[int]) -> tuple[tuple[int, ...], Params, int]:
@@ -125,9 +126,9 @@ def init_lpcf_params(
         "sections_static": sections_static,
         "shapes": shapes,
         "output_dim": int(output_dim),
-        "positive_map": "relu",
+        "positive_map": "softplus",
         "activation": "softplus",
-        "output_activation": "softplus",
+        "output_activation": "squared_relu",
         "hyper": init_psi_params(key_psi, theta_dim, hyper_widths, output_dim),
     }
 
@@ -152,15 +153,17 @@ def unpack_lpcf_tensors_from_sections(
     sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
     emitted: jnp.ndarray,
 ) -> Params:
-    """Unpack psi(theta)'s flat vector into main ICNN tensors."""
+    """Unpack psi(theta)'s flat vector into fan-in-scaled main ICNN tensors."""
     tensors: Params = {"W": [], "raw_W": [], "V": [], "omega": []}
     sections_w, sections_v, sections_o = sections
     for start, end, shape in sections_w:
         raw = emitted[start:end].reshape(shape)
+        fan_in = shape[1]
         tensors["raw_W"].append(raw)
-        tensors["W"].append(MAKE_POSITIVE(raw))
+        tensors["W"].append(MAKE_POSITIVE(raw) / fan_in)
     for start, end, shape in sections_v:
-        tensors["V"].append(emitted[start:end].reshape(shape))
+        fan_in = shape[1]
+        tensors["V"].append(emitted[start:end].reshape(shape) / np.sqrt(fan_in))
     for start, end, shape in sections_o:
         tensors["omega"].append(emitted[start:end].reshape(shape))
     return tensors
@@ -273,6 +276,7 @@ def loss_fn(
     l2_reg: float = 0.0,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
     """Public loss wrapper compatible with the existing training script."""
+    del l2_reg
     feasibility_weight = 0.0 if feasibility_data is None else float(feasibility_data.get("weight", 0.0))
     objective, (value_mse, grad_mse) = _loss_from_hyper(
         params["hyper"],
@@ -300,18 +304,19 @@ def loss_fn(
         grad_orig = g_pred * env_scale / q_std
         theta_orig = theta * theta_std + theta_mean
         x0 = theta_orig[:, : int(feasibility_data["x0_dim"])]
+        if feasibility_data.get("gamma_feature") == "log_gamma":
+            gamma = jnp.exp(theta_orig[:, int(feasibility_data["x0_dim"])])
+        elif feasibility_data.get("gamma_feature") == "gamma":
+            gamma = theta_orig[:, int(feasibility_data["x0_dim"])]
+        gamma_factor = gamma[:, None] if jnp.ndim(gamma) else gamma
         g_matrix = jnp.asarray(feasibility_data["g_matrix"], dtype=q.dtype)
         b_offset = jnp.asarray(feasibility_data["b_offset"], dtype=q.dtype)
         b_theta = jnp.asarray(feasibility_data["b_theta"], dtype=q.dtype)
-        violation = (q_orig - gamma * grad_orig) @ g_matrix.T - (
+        violation = (q_orig - gamma_factor * grad_orig) @ g_matrix.T - (
             b_offset[None, :] + x0 @ b_theta.T
         )
         feas_mse = jnp.mean(jax.nn.relu(violation) ** 2)
         objective += feasibility_weight * feas_mse
-    if l2_reg:
-        objective += l2_reg * sum(
-            jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(params["hyper"])
-        )
     return objective, (value_mse, grad_mse, feas_mse)
 
 
@@ -403,6 +408,7 @@ def train_lpcf(
     g_val: np.ndarray | None = None,
     w_val: np.ndarray | None = None,
     feasibility_data: Params | None = None,
+    eval_interval: int = 50,
 ) -> Params:
     """Train an LPCF with value and q-gradient supervision."""
     key = jax.random.PRNGKey(seed)
@@ -442,6 +448,7 @@ def train_lpcf(
     optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=l2_reg)
     opt_state = optimizer.init(params["hyper"])
     train_step = make_train_step(optimizer, sections)
+    eval_interval = max(1, int(eval_interval))
 
     def metric_value(objective, parts):
         if selection_metric == "value":
@@ -467,7 +474,7 @@ def train_lpcf(
                 value_weight,
             )
 
-        if epoch % max(1, epochs // 10) == 0 or epoch == 1:
+        if epoch == 1 or epoch % eval_interval == 0 or epoch == epochs:
             train_obj, train_parts = loss_fn(
                 params,
                 qj,

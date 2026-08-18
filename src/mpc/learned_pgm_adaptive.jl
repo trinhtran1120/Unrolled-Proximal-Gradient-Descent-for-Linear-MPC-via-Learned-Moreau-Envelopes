@@ -12,14 +12,16 @@ function learned_grad_ME(
     x0::Vector{Float64},
     rho::Real,
 )
-    input = vcat(vec(W), x0, log(rho))
+    # The learned PCF represents psi(q; x0) = 0.5 * dist_F(x0)(q)^2.
+    # For the indicator constraint, grad phi^rho = grad psi / rho.
+    input = vcat(vec(W), x0)
     full_gradient = learned_moreau_full_gradient(
         model,
         input,
         rho,
     )
     control_dim = system.nu * system.N
-    return reshape(full_gradient[1:control_dim], system.nu, system.N)
+    return reshape(full_gradient[1:control_dim], system.nu, system.N) ./ rho
 end
 
 

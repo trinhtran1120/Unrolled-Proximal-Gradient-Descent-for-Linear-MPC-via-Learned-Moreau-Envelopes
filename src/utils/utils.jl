@@ -28,6 +28,20 @@ softplus(x) = log1p(exp(-abs(x))) + max(x, zero(x))
 sigmoid(x) = x >= 0 ? inv(1 + exp(-x)) : exp(x) / (1 + exp(x))
 
 
+uses_fanin_scaling(model::LearnedPCF) = model.output_activation == "squared_relu"
+
+
+function positive_weight(model::LearnedPCF, raw::AbstractMatrix)
+    W = softplus.(raw)
+    return uses_fanin_scaling(model) ? W ./ size(raw, 2) : W
+end
+
+
+function input_weight(model::LearnedPCF, raw::AbstractMatrix)
+    return uses_fanin_scaling(model) ? raw ./ sqrt(size(raw, 2)) : raw
+end
+
+
 function json_matrix(value)
     return Float64.(reduce(hcat, value)')
 end
@@ -85,7 +99,7 @@ function pcf_hyper_forward(model::LearnedPCF, theta::AbstractVector)
     if !isempty(model.V_psi)
         out = model.V_psi[1] * theta .+ model.omega_psi[1]
         for layer_index in 2:length(model.V_psi)
-            out = max.(0.0, out)
+            out = softplus.(out)
             out = (
                 model.W_psi[layer_index - 1] * out
                 .+ model.V_psi[layer_index] * theta
@@ -238,24 +252,30 @@ function pcf_value_and_grad_normalized(
 )
     weights = unpack_pcf_weights(model, pcf_hyper_forward(model, theta_norm))
 
-    pre = weights.V[1] * q_norm .+ weights.omega[1]
+    V = input_weight(model, weights.V[1])
+    pre = V * q_norm .+ weights.omega[1]
     z = softplus.(pre)
-    dz_dq = Diagonal(sigmoid.(pre)) * weights.V[1]
+    dz_dq = Diagonal(sigmoid.(pre)) * V
 
     for layer_idx in 2:length(weights.V)
-        W_pos = softplus.(weights.W[layer_idx - 1])
-        pre = W_pos * z .+ weights.V[layer_idx] * q_norm .+ weights.omega[layer_idx]
-        dpre_dq = W_pos * dz_dq .+ weights.V[layer_idx]
+        W_pos = positive_weight(model, weights.W[layer_idx - 1])
+        V = input_weight(model, weights.V[layer_idx])
+        pre = W_pos * z .+ V * q_norm .+ weights.omega[layer_idx]
+        dpre_dq = W_pos * dz_dq .+ V
         z = softplus.(pre)
         dz_dq = Diagonal(sigmoid.(pre)) * dpre_dq
     end
 
-    W_out = vec(softplus.(weights.W_out[1, :]))
-    raw_value = dot(W_out, z) + dot(vec(weights.V_out[1, :]), q_norm) + weights.omega_out[1]
-    raw_grad_q = W_out' * dz_dq .+ vec(weights.V_out[1, :])'
+    W_out = vec(positive_weight(model, weights.W_out)[1, :])
+    V_out = input_weight(model, weights.V_out)
+    raw_value = dot(W_out, z) + dot(vec(V_out[1, :]), q_norm) + weights.omega_out[1]
+    raw_grad_q = W_out' * dz_dq .+ vec(V_out[1, :])'
     if model.output_activation == "softplus"
         value = softplus(raw_value)
         grad_q = sigmoid(raw_value) .* raw_grad_q
+    elseif model.output_activation == "squared_relu"
+        value = 0.5 * max(raw_value, 0.0)^2
+        grad_q = max(raw_value, 0.0) .* raw_grad_q
     else
         value = raw_value
         grad_q = raw_grad_q
