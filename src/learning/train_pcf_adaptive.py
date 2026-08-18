@@ -16,15 +16,15 @@ project_dir = script_dir.parents[1]
 data_dir = project_dir / "data"
 model_dir = project_dir / "model"
 
-train_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-train_fix.npz"
-test_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-test_fix.npz"
-model_path = model_dir / "linear-mpc-lpcf001-fix"
+train_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-train_adaptive.npz"
+test_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-test_adaptive.npz"
+model_path = model_dir / "linear-mpc-lpcf001-adaptive"
 
 convex_widths = [16, 16]
 hyper_widths = [64, 64]
 learning_rate = 1e-3
 lr_decay_rate = 0.98
-lr_decay_steps = 10000
+lr_decay_steps = 5000
 grad_weight = 10.0
 value_weight = 1.0
 selection_metric = "grad"
@@ -35,14 +35,14 @@ epochs = 3000
 seed = 0
 normalization_eps = 1e-8
 normalize_data = False
-normalize_gamma = False
+normalize_gamma = True
 normalize_env = True
-adaptive_step_size = False
+adaptive_step_size = True
 
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
-from pcf import (
+from pcf_adaptive import (
     init_lpcf_params,
     loss_fn,
     train_lpcf,
@@ -102,7 +102,7 @@ def load_dataset(path: Path):
 
         if adaptive_step_size:
             gamma_fixed = float(np.median(gamma))
-            theta = np.hstack((x0, gamma[:, None]))
+            theta = np.hstack((x0, np.log(gamma)[:, None]))
             theta_dim = x0_dim + 1
         else:
             gamma_fixed = _require_fixed_gamma(path, gamma)
@@ -119,8 +119,8 @@ def load_dataset(path: Path):
             "x0_dim": x0_dim,
             "rho_initial": float(data["rho_initial"]),
             "gamma_fixed": gamma_fixed,
-            "gamma_feature": "gamma" if adaptive_step_size else "none",
-            "parameter": "x0_gamma" if adaptive_step_size else "x0",
+            "gamma_feature": "log_gamma" if adaptive_step_size else "none",
+            "parameter": "x0_log_gamma" if adaptive_step_size else "x0",
             "adaptive_data": adaptive,
             "gamma_min": float(np.min(gamma)),
             "gamma_median": float(np.median(gamma)),

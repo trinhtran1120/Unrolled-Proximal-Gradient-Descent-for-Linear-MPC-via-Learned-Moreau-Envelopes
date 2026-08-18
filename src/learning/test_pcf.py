@@ -14,7 +14,7 @@ THIS_DIR = Path(__file__).resolve().parent
 if str(THIS_DIR) not in sys.path:
     sys.path.insert(0, str(THIS_DIR))
 
-from pcf import (  # noqa: E402
+from learning.pcf_fix import (  # noqa: E402
     MpcPcf,
     init_lpcf_params,
     loss_fn,
