@@ -35,6 +35,7 @@ function learned_PGM(
     U = zeros(Float64, system.nu, system.N)
     W = similar(U)
     U_next = similar(U)
+    feasible_set = constraint(system, x0; solver = :osqp)
 
     objective_history = Float64[]
     residual_history = Float64[]
@@ -55,6 +56,7 @@ function learned_PGM(
             rho_backward,
         )
         @. U_next = W - rho_backward * moreau_grad
+        prox!(vec(U_next), feasible_set, vec(U_next), rho_backward)
 
         residual = norm(U_next - U, Inf)
         push!(residual_history, residual)

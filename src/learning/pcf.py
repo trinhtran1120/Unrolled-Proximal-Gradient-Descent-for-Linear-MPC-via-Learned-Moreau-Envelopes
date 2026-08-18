@@ -1,99 +1,96 @@
-"""mpc-specific lpcf model with autodiff gradient in the convex variable."""
-
 from __future__ import annotations
 
-from typing import Sequence
+from functools import partial
+from typing import Any, Iterator, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from utils_sc import (
-    act_p,
-    activation,
-    as_training_arrays,
-    batch_iterator,
-    copy_params,
-    default_convex_widths,
-    default_hyper_widths,
-    feasibility_weight,
-    glorot_uniform,
-    gradient_loss_scale,
-    init_scale,
-    params_t,
-    soft_feasibility_penalty,
-    validate_widths,
-)
+Params = dict[str, Any]
+Batch = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
+Section = tuple[int, int, tuple[int, ...]]
+
+convex_widths = (32, 32)
+hyper_widths = (64, 64)
 
 
-def _lpcf_shapes(
-    q_dim: int,
-    convex_widths: Sequence[int],
-) -> tuple[tuple[tuple[int, ...], ...], tuple[int, ...], int]:
-    """plan flat hypernetwork output shapes for lpcf tensors."""
-    if q_dim <= 0:
-        raise ValueError("q_dim must be positive")
+def MAKE_POSITIVE(x: jnp.ndarray) -> jnp.ndarray:
+    """Project ICNN recurrent weights to the nonnegative orthant."""
+    return jax.nn.relu(x)
 
-    widths = validate_widths(convex_widths, "convex_widths")
-    layer_dims = (q_dim, *widths, 1)
-    hidden_dims = layer_dims[1:-1]
-    shapes: list[tuple[int, ...]] = []
 
-    for layer_idx, hidden_dim in enumerate(hidden_dims):
-        if layer_idx > 0:
-            shapes.append((hidden_dim, hidden_dims[layer_idx - 1]))
-        shapes.append((hidden_dim, q_dim))
-        shapes.append((hidden_dim,))
+def activation(x: jnp.ndarray) -> jnp.ndarray:
+    """Convex nondecreasing activation used by the main ICNN and psi."""
+    return jax.nn.softplus(x)
 
-    shapes.append((1, hidden_dims[-1]))
-    shapes.append((1, q_dim))
-    shapes.append((1,))
 
-    emit_dim = int(sum(np.prod(shape) for shape in shapes))
-    return tuple(shapes), layer_dims, emit_dim
+def output_activation(x: jnp.ndarray) -> jnp.ndarray:
+    """Nonnegative convex output for Moreau-envelope values."""
+    return jax.nn.softplus(x)
+
+
+def rand_uniform(key: jax.Array, shape: tuple[int, ...]) -> jnp.ndarray:
+    """Match source _rand: entries sampled from [-0.5, 0.5]."""
+    return jax.random.uniform(key, shape, minval=-0.5, maxval=0.5)
+
+
+def make_sections(q_dim: int, widths: Sequence[int]) -> tuple[tuple[int, ...], Params, int]:
+    """Plan slices for psi(theta)'s flat output.
+
+    Flatten order follows ``pcf_sc.py``: all W, then all V, then all omega.
+    """
+    layer_dims = (int(q_dim), *tuple(int(width) for width in widths), 1)
+    sections_w: list[Section] = []
+    sections_v: list[Section] = []
+    sections_o: list[Section] = []
+    offset = 0
+
+    def append(sections: list[Section], shape: tuple[int, ...]) -> None:
+        nonlocal offset
+        size = int(np.prod(shape))
+        sections.append((offset, offset + size, shape))
+        offset += size
+
+    for layer_idx in range(2, len(layer_dims)):
+        append(sections_w, (layer_dims[layer_idx], layer_dims[layer_idx - 1]))
+    for layer_idx in range(1, len(layer_dims)):
+        append(sections_v, (layer_dims[layer_idx], q_dim))
+    for layer_idx in range(1, len(layer_dims)):
+        append(sections_o, (layer_dims[layer_idx],))
+
+    sections = {
+        "W": tuple(sections_w),
+        "V": tuple(sections_v),
+        "omega": tuple(sections_o),
+    }
+    return layer_dims, sections, offset
 
 
 def init_psi_params(
     key: jax.Array,
     theta_dim: int,
-    hidden_widths: Sequence[int],
+    hyper_widths: Sequence[int],
     output_dim: int,
-) -> params_t:
-    """initialize the LPCF psi network weights W_psi, V_psi, omega_psi."""
-    if theta_dim <= 0:
-        raise ValueError("theta_dim must be positive")
-    if output_dim <= 0:
-        raise ValueError("output_dim must be positive")
-
-    hidden_widths = validate_widths(hidden_widths, "hidden_widths")
-    w_psi = (theta_dim, *hidden_widths, output_dim)
-    W_count = len(w_psi) - 2
-    V_count = len(w_psi) - 1
-    keys = jax.random.split(key, W_count + V_count)
-
+) -> Params:
+    """Initialize the residual/feedforward psi network from ``pcf_sc.py``."""
+    dims = (int(theta_dim), *tuple(int(width) for width in hyper_widths), int(output_dim))
+    keys = jax.random.split(key, 3 * (len(dims) - 1))
+    key_idx = 0
     W_psi: list[jnp.ndarray] = []
     V_psi: list[jnp.ndarray] = []
     omega_psi: list[jnp.ndarray] = []
 
-    key_idx = 0
-    for layer_idx in range(1, len(w_psi) - 1):
-        scale = 1.0 if layer_idx < len(w_psi) - 2 else init_scale
-        W_psi.append(
-            scale
-            * glorot_uniform(
-                keys[key_idx],
-                (w_psi[layer_idx + 1], w_psi[layer_idx]),
+    for layer_idx in range(1, len(dims)):
+        if layer_idx > 1:
+            W_psi.append(
+                rand_uniform(keys[key_idx], (dims[layer_idx], dims[layer_idx - 1]))
             )
-        )
+            key_idx += 1
+        V_psi.append(rand_uniform(keys[key_idx], (dims[layer_idx], theta_dim)))
         key_idx += 1
-
-    for layer_idx in range(len(w_psi) - 1):
-        scale = 1.0 if layer_idx < len(w_psi) - 2 else init_scale
-        V_psi.append(
-            scale * glorot_uniform(keys[key_idx], (w_psi[layer_idx + 1], theta_dim))
-        )
-        omega_psi.append(jnp.zeros((w_psi[layer_idx + 1],)))
+        omega_psi.append(rand_uniform(keys[key_idx], (dims[layer_idx],)))
         key_idx += 1
 
     return {"W_psi": W_psi, "V_psi": V_psi, "omega_psi": omega_psi}
@@ -103,16 +100,20 @@ def init_lpcf_params(
     key: jax.Array,
     q_dim: int,
     theta_dim: int,
-    convex_widths: Sequence[int] = default_convex_widths,
-    hyper_widths: Sequence[int] = default_hyper_widths,
-) -> params_t:
-    """initialize lpcf parameters."""
-    if theta_dim <= 0:
-        raise ValueError("theta_dim must be positive")
-
-    convex_widths = validate_widths(convex_widths, "convex_widths")
-    hyper_widths = validate_widths(hyper_widths, "hyper_widths")
-    shapes, layer_dims, emit_dim = _lpcf_shapes(q_dim, convex_widths)
+    convex_widths: Sequence[int] = convex_widths,
+    hyper_widths: Sequence[int] = hyper_widths,
+) -> Params:
+    """Initialize LPCF metadata and trainable psi parameters."""
+    convex_widths = tuple(int(width) for width in convex_widths)
+    hyper_widths = tuple(int(width) for width in hyper_widths)
+    key_psi, _ = jax.random.split(key)
+    layer_dims, sections, output_dim = make_sections(q_dim, convex_widths)
+    shapes = tuple(
+        [section[2] for section in sections["W"]]
+        + [section[2] for section in sections["V"]]
+        + [section[2] for section in sections["omega"]]
+    )
+    sections_static = (sections["W"], sections["V"], sections["omega"])
 
     return {
         "q_dim": int(q_dim),
@@ -120,237 +121,225 @@ def init_lpcf_params(
         "convex_widths": convex_widths,
         "hyper_widths": hyper_widths,
         "layer_dims": layer_dims,
+        "sections": sections,
+        "sections_static": sections_static,
         "shapes": shapes,
-        "hyper": init_psi_params(key, theta_dim, hyper_widths, emit_dim),
+        "output_dim": int(output_dim),
+        "positive_map": "relu",
+        "activation": "softplus",
+        "output_activation": "softplus",
+        "hyper": init_psi_params(key_psi, theta_dim, hyper_widths, output_dim),
     }
 
+
 @jax.jit
-def psi_flat_function(theta: jnp.ndarray, hyper_params: params_t) -> jnp.ndarray:
-    """evaluate psi(theta) as the flat vector emitted by the psi network."""
-    W_psi = hyper_params["W_psi"]
-    V_psi = hyper_params["V_psi"]
-    omega_psi = hyper_params["omega_psi"]
+def psi_flat_function(theta: jnp.ndarray, hyper: Params) -> jnp.ndarray:
+    """Evaluate psi(theta), matching the residual/feedforward form in pcf_sc."""
+    W_psi, V_psi, omega_psi = hyper["W_psi"], hyper["V_psi"], hyper["omega_psi"]
     out = jnp.dot(V_psi[0], theta) + omega_psi[0]
     for layer_idx in range(1, len(V_psi)):
-        out = jax.nn.relu(out)
+        out = activation(out)
         out = (
             jnp.dot(W_psi[layer_idx - 1], out)
             + jnp.dot(V_psi[layer_idx], theta)
             + omega_psi[layer_idx]
         )
-    return out
+    return out.squeeze()
 
 
-def generate_psi_flat(hyper_params: params_t):
-    """generate the jitted flat psi(theta) evaluator used by exporters."""
-
-    @jax.jit
-    def psi_flat(theta: jnp.ndarray) -> jnp.ndarray:
-        return psi_flat_function(theta, hyper_params).squeeze()
-
-    return psi_flat
-
-
-def unpack_lpcf_tensors(params: params_t, emitted: jnp.ndarray) -> params_t:
-    """unpack psi(theta)'s flat output into variable-network tensors."""
-    offset = 0
-    shape_idx = 0
-    shapes = params["shapes"]
-    convex_widths = params["convex_widths"]
-    W: list[jnp.ndarray] = []
-    V: list[jnp.ndarray] = []
-    omega: list[jnp.ndarray] = []
-
-    def take(shape: tuple[int, ...]) -> jnp.ndarray:
-        nonlocal offset
-        size = int(np.prod(shape))
-        value = emitted[offset : offset + size].reshape(shape)
-        offset += size
-        return value
-
-    for layer_idx in range(len(convex_widths)):
-        if layer_idx > 0:
-            W.append(take(shapes[shape_idx]))
-            shape_idx += 1
-        V.append(take(shapes[shape_idx]))
-        shape_idx += 1
-        omega.append(take(shapes[shape_idx]))
-        shape_idx += 1
-
-    W.append(take(shapes[shape_idx]))
-    V.append(take(shapes[shape_idx + 1]))
-    omega.append(take(shapes[shape_idx + 2]))
-    return {
-        "W": W,
-        "V": V,
-        "omega": omega,
-    }
+@partial(jax.jit, static_argnames=("sections",))
+def unpack_lpcf_tensors_from_sections(
+    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
+    emitted: jnp.ndarray,
+) -> Params:
+    """Unpack psi(theta)'s flat vector into main ICNN tensors."""
+    tensors: Params = {"W": [], "raw_W": [], "V": [], "omega": []}
+    sections_w, sections_v, sections_o = sections
+    for start, end, shape in sections_w:
+        raw = emitted[start:end].reshape(shape)
+        tensors["raw_W"].append(raw)
+        tensors["W"].append(MAKE_POSITIVE(raw))
+    for start, end, shape in sections_v:
+        tensors["V"].append(emitted[start:end].reshape(shape))
+    for start, end, shape in sections_o:
+        tensors["omega"].append(emitted[start:end].reshape(shape))
+    return tensors
 
 
-def psi_function(theta: jnp.ndarray, params: params_t) -> params_t:
-    """evaluate psi(theta) and unpack its output into W, V, and omega."""
-    return unpack_lpcf_tensors(params, psi_flat_function(theta, params["hyper"]))
+def unpack_lpcf_tensors(params: Params, emitted: jnp.ndarray) -> Params:
+    """Public unpack helper used by tests and diagnostics."""
+    return unpack_lpcf_tensors_from_sections(params["sections_static"], emitted)
 
 
-def lpcf_forward(params: params_t, q: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
-    """evaluate scalar f(q, theta)."""
-    p = psi_function(theta, params)
+@partial(jax.jit, static_argnames=("sections",))
+def lpcf_forward(
+    hyper: Params,
+    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
+    q: jnp.ndarray,
+    theta: jnp.ndarray,
+) -> jnp.ndarray:
+    """Evaluate the scalar LPCF output for one ``(q, theta)`` pair."""
+    emitted = psi_flat_function(theta, hyper)
+    tensors = unpack_lpcf_tensors_from_sections(sections, emitted)
+    W, V, omega = tensors["W"], tensors["V"], tensors["omega"]
 
-    z = jnp.dot(p["V"][0], q) + p["omega"][0]
-    for layer_idx in range(1, len(p["V"])):
-        z = (
-            jnp.dot(act_p(p["W"][layer_idx - 1]), activation(z))
-            + jnp.dot(p["V"][layer_idx], q)
-            + p["omega"][layer_idx]
+    z = activation(jnp.dot(V[0], q) + omega[0])
+    for layer_idx in range(1, len(V) - 1):
+        z = activation(
+            jnp.dot(W[layer_idx - 1], z)
+            + jnp.dot(V[layer_idx], q)
+            + omega[layer_idx]
         )
 
-    return z[0]
+    raw = (
+        jnp.dot(W[-1], z).squeeze()
+        + jnp.dot(V[-1], q).squeeze()
+        + omega[-1].squeeze()
+    )
+    return output_activation(raw)
 
-def value_and_grad_wrt_q(
-    params: params_t,
+
+@partial(jax.jit, static_argnames=("sections",))
+def _batched_value_and_grad_from_hyper(
+    hyper: Params,
+    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
     q: jnp.ndarray,
     theta: jnp.ndarray,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """evaluate f and use jax autodiff for df/dq."""
-    value = lpcf_forward(params, q, theta)
-    grad_q = jax.grad(lpcf_forward, argnums=1)(params, q, theta)
-    return value, grad_q
-
-def grad_wrt_q(params: params_t, q: jnp.ndarray, theta: jnp.ndarray) -> jnp.ndarray:
-    """return the autodiff gradient with respect to q."""
-    return jax.grad(lpcf_forward, argnums=1)(params, q, theta)
-
-
-batched_forward = jax.vmap(lpcf_forward, in_axes=(None, 0, 0))
-batched_value_and_grad_wrt_q = jax.vmap(value_and_grad_wrt_q, in_axes=(None, 0, 0))
-batched_grad_wrt_q = jax.vmap(grad_wrt_q, in_axes=(None, 0, 0))
+    """Evaluate batched values and q-gradients."""
+    values = jax.vmap(lpcf_forward, in_axes=(None, None, 0, 0))(
+        hyper, sections, q, theta
+    )
+    grads = jax.vmap(
+        jax.grad(lpcf_forward, argnums=2),
+        in_axes=(None, None, 0, 0),
+    )(hyper, sections, q, theta)
+    return values, grads
 
 
-def _with_hyper(params_template: params_t, hyper_params: params_t) -> params_t:
-    """combine static lpcf metadata with trainable hypernetwork parameters."""
-    params = dict(params_template)
-    params["hyper"] = hyper_params
-    return params
+def value_and_grad(params: Params, q: np.ndarray, theta: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Return batched values and q-gradients."""
+    return _batched_value_and_grad_from_hyper(
+        params["hyper"],
+        params["sections_static"],
+        jnp.asarray(q, dtype=jnp.float32),
+        jnp.asarray(theta, dtype=jnp.float32),
+    )
 
-def value_and_grad_wrt_q_from_hyper(
-    params_template: params_t,
-    hyper_params: params_t,
+
+def predict(params: Params, q: np.ndarray, theta: np.ndarray) -> jnp.ndarray:
+    """Return batched scalar predictions."""
+    values, _ = value_and_grad(params, q, theta)
+    return values
+
+
+def grad(params: Params, q: np.ndarray, theta: np.ndarray) -> jnp.ndarray:
+    """Return batched q-gradients."""
+    _, grads = value_and_grad(params, q, theta)
+    return grads
+
+
+@partial(jax.jit, static_argnames=("sections",))
+def _loss_from_hyper(
+    hyper: Params,
+    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
     q: jnp.ndarray,
     theta: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """evaluate value and autodiff q-gradient when only hyper params are dynamic."""
-    return value_and_grad_wrt_q(_with_hyper(params_template, hyper_params), q, theta)
+    y: jnp.ndarray,
+    g: jnp.ndarray,
+    w: jnp.ndarray,
+    grad_weight: float = 1.0,
+    value_weight: float = 1.0,
+) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray]]:
+    """Return total loss and value/gradient components."""
+    y_pred, g_pred = _batched_value_and_grad_from_hyper(hyper, sections, q, theta)
+    normalized_weights = w / jnp.maximum(jnp.mean(w), 1e-12)
 
-def batched_value_and_grad_wrt_q_from_hyper(
-    params_template: params_t,
-    hyper_params: params_t,
-    q: jnp.ndarray,
-    theta: jnp.ndarray,
-) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """evaluate batched values and autodiff q-gradients."""
-    return jax.vmap(
-        lambda qi, thetai: value_and_grad_wrt_q_from_hyper(
-            params_template,
-            hyper_params,
-            qi,
-            thetai,
-        )
-    )(q, theta)
+    value_mse = jnp.mean(normalized_weights * (y_pred - y) ** 2)
+    grad_mse = jnp.mean(normalized_weights * jnp.sum((g_pred - g) ** 2, axis=1))
+    return value_weight * value_mse + grad_weight * grad_mse, (value_mse, grad_mse)
 
-
-def make_batched_value_and_grad(params_template: params_t):
-    """build a jitted batched value/gradient evaluator."""
-
-    @jax.jit
-    def batched(hyper_params: params_t, q: jnp.ndarray, theta: jnp.ndarray):
-        return batched_value_and_grad_wrt_q_from_hyper(
-            params_template,
-            hyper_params,
-            q,
-            theta,
-        )
-
-    return batched
 
 def loss_fn(
-    params: params_t,
-    qb: jnp.ndarray,
-    thetab: jnp.ndarray,
-    yb: jnp.ndarray,
-    gb: jnp.ndarray,
-    wb: jnp.ndarray,
+    params: Params,
+    q: jnp.ndarray,
+    theta: jnp.ndarray,
+    y: jnp.ndarray,
+    g: jnp.ndarray,
+    w: jnp.ndarray,
     grad_weight: float = 1.0,
-    feasibility_data: params_t | None = None,
+    value_weight: float = 1.0,
+    feasibility_data: Params | None = None,
+    l2_reg: float = 0.0,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-    """return value, gradient, and soft feasibility loss from paper.md."""
-    y_pred, g_pred = batched_value_and_grad_wrt_q(params, qb, thetab)
-    alpha = wb / jnp.maximum(jnp.mean(wb), 1e-12)
-    gradient_scale = gradient_loss_scale(feasibility_data, qb.dtype)
-    value_mse = jnp.mean(alpha * (y_pred - yb) ** 2)
-    grad_mse = jnp.mean(
-        alpha * jnp.sum(((g_pred - gb) * gradient_scale) ** 2, axis=1)
+    """Public loss wrapper compatible with the existing training script."""
+    feasibility_weight = 0.0 if feasibility_data is None else float(feasibility_data.get("weight", 0.0))
+    objective, (value_mse, grad_mse) = _loss_from_hyper(
+        params["hyper"],
+        params["sections_static"],
+        q,
+        theta,
+        y,
+        g,
+        w,
+        grad_weight,
+        value_weight,
     )
-    feasibility_mse = soft_feasibility_penalty(
-        qb,
-        thetab,
-        g_pred,
-        alpha,
-        feasibility_data,
-    )
-    feasibility_penalty_weight = feasibility_weight(feasibility_data)
-    loss = value_mse + grad_weight * grad_mse + (
-        feasibility_penalty_weight * feasibility_mse
-    )
-    return loss, (value_mse, grad_mse, feasibility_mse)
+    feas_mse = jnp.array(0.0, dtype=q.dtype)
+    if feasibility_weight:
+        _, g_pred = _batched_value_and_grad_from_hyper(
+            params["hyper"], params["sections_static"], q, theta
+        )
+        q_mean = jnp.asarray(feasibility_data["q_mean"], dtype=q.dtype)
+        q_std = jnp.asarray(feasibility_data["q_std"], dtype=q.dtype)
+        theta_mean = jnp.asarray(feasibility_data["theta_mean"], dtype=theta.dtype)
+        theta_std = jnp.asarray(feasibility_data["theta_std"], dtype=theta.dtype)
+        env_scale = jnp.asarray(feasibility_data["env_scale"], dtype=q.dtype)
+        gamma = jnp.asarray(feasibility_data["gamma"], dtype=q.dtype)
+        q_orig = q * q_std + q_mean
+        grad_orig = g_pred * env_scale / q_std
+        theta_orig = theta * theta_std + theta_mean
+        x0 = theta_orig[:, : int(feasibility_data["x0_dim"])]
+        g_matrix = jnp.asarray(feasibility_data["g_matrix"], dtype=q.dtype)
+        b_offset = jnp.asarray(feasibility_data["b_offset"], dtype=q.dtype)
+        b_theta = jnp.asarray(feasibility_data["b_theta"], dtype=q.dtype)
+        violation = (q_orig - gamma * grad_orig) @ g_matrix.T - (
+            b_offset[None, :] + x0 @ b_theta.T
+        )
+        feas_mse = jnp.mean(jax.nn.relu(violation) ** 2)
+        objective += feasibility_weight * feas_mse
+    if l2_reg:
+        objective += l2_reg * sum(
+            jnp.sum(leaf**2) for leaf in jax.tree_util.tree_leaves(params["hyper"])
+        )
+    return objective, (value_mse, grad_mse, feas_mse)
 
-def loss_fn_from_hyper(
-    params_template: params_t,
-    hyper_params: params_t,
-    qb: jnp.ndarray,
-    thetab: jnp.ndarray,
-    yb: jnp.ndarray,
-    gb: jnp.ndarray,
-    wb: jnp.ndarray,
-    grad_weight: float = 1.0,
-    feasibility_data: params_t | None = None,
-) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-    """return the lpcf training loss using batched hypernetwork evaluation."""
-    y_pred, g_pred = batched_value_and_grad_wrt_q_from_hyper(
-        params_template,
-        hyper_params,
-        qb,
-        thetab,
-    )
-    alpha = wb / jnp.maximum(jnp.mean(wb), 1e-12)
-    gradient_scale = gradient_loss_scale(feasibility_data, qb.dtype)
-    value_mse = jnp.mean(alpha * (y_pred - yb) ** 2)
-    grad_mse = jnp.mean(
-        alpha * jnp.sum(((g_pred - gb) * gradient_scale) ** 2, axis=1)
-    )
-    feasibility_mse = soft_feasibility_penalty(
-        qb,
-        thetab,
-        g_pred,
-        alpha,
-        feasibility_data,
-    )
-    feasibility_penalty_weight = feasibility_weight(feasibility_data)
-    loss = value_mse + grad_weight * grad_mse + (
-        feasibility_penalty_weight * feasibility_mse
-    )
-    return loss, (value_mse, grad_mse, feasibility_mse)
+
+def batch_iterator(
+    q: jnp.ndarray,
+    theta: jnp.ndarray,
+    y: jnp.ndarray,
+    g: jnp.ndarray,
+    w: jnp.ndarray,
+    batch_size: int,
+    shuffle_key: jax.Array,
+) -> Iterator[Batch]:
+    """Yield shuffled mini-batches."""
+    permutation = jax.random.permutation(shuffle_key, q.shape[0])
+    for start in range(0, q.shape[0], batch_size):
+        indices = permutation[start : start + batch_size]
+        yield q[indices], theta[indices], y[indices], g[indices], w[indices]
 
 
 def make_train_step(
     optimizer: optax.GradientTransformation,
-    params_template: params_t,
-    feasibility_data: params_t | None,
+    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
 ):
-    """build one jitted optimizer step."""
+    """Build one JIT-compiled optimizer step."""
 
     @jax.jit
     def train_step(
-        hyper_params: params_t,
+        hyper: Params,
         opt_state: optax.OptState,
         qb: jnp.ndarray,
         thetab: jnp.ndarray,
@@ -358,220 +347,34 @@ def make_train_step(
         gb: jnp.ndarray,
         wb: jnp.ndarray,
         grad_weight: float,
+        value_weight: float,
     ):
-        def hyper_loss(hyper_params: params_t):
-            return loss_fn_from_hyper(
-                params_template,
-                hyper_params,
-                qb,
-                thetab,
-                yb,
-                gb,
-                wb,
-                grad_weight,
-                feasibility_data,
-            )
-
-        (loss, (vmse, gmse, fmse)), grads = jax.value_and_grad(hyper_loss, has_aux=True)(
-            hyper_params
+        (loss, (vmse, gmse)), grads = jax.value_and_grad(
+            _loss_from_hyper,
+            has_aux=True,
+        )(
+            hyper,
+            sections,
+            qb,
+            thetab,
+            yb,
+            gb,
+            wb,
+            grad_weight,
+            value_weight,
         )
-        updates, opt_state = optimizer.update(grads, opt_state, hyper_params)
-        hyper_params = optax.apply_updates(hyper_params, updates)
-        return hyper_params, opt_state, loss, vmse, gmse, fmse
+        updates, opt_state = optimizer.update(grads, opt_state, hyper)
+        hyper = optax.apply_updates(hyper, updates)
+        return hyper, opt_state, loss, vmse, gmse
 
     return train_step
 
 
-def make_eval_step(
-    params_template: params_t,
-    feasibility_data: params_t | None,
-):
-    """build a jitted validation objective for model selection and logging."""
-    batched_eval = make_batched_value_and_grad(params_template)
-
-    @jax.jit
-    def eval_step(
-        hyper_params: params_t,
-        q: jnp.ndarray,
-        theta: jnp.ndarray,
-        y: jnp.ndarray,
-        g: jnp.ndarray,
-        w: jnp.ndarray,
-        grad_weight: float,
-    ):
-        y_pred, g_pred = batched_eval(hyper_params, q, theta)
-        alpha = w / jnp.maximum(jnp.mean(w), 1e-12)
-        gradient_scale = gradient_loss_scale(feasibility_data, q.dtype)
-        value_mse = jnp.mean(alpha * (y_pred - y) ** 2)
-        grad_mse = jnp.mean(
-            alpha * jnp.sum(((g_pred - g) * gradient_scale) ** 2, axis=1)
-        )
-        feasibility_mse = soft_feasibility_penalty(
-            q,
-            theta,
-            g_pred,
-            alpha,
-            feasibility_data,
-        )
-        feasibility_penalty_weight = feasibility_weight(feasibility_data)
-        selection_obj = value_mse + grad_weight * grad_mse + (
-            feasibility_penalty_weight * feasibility_mse
-        )
-        return selection_obj, value_mse, grad_mse, feasibility_mse
-
-    return eval_step
-
-
-class MpcPcf:
-    """object-oriented wrapper for the mpc-specific lpcf model."""
-
-    def __init__(
-        self,
-        q_dim: int,
-        theta_dim: int,
-        convex_widths: Sequence[int] = default_convex_widths,
-        hyper_widths: Sequence[int] = default_hyper_widths,
-        seed: int = 0,
-        params: params_t | None = None,
-    ) -> None:
-        self.q_dim = int(q_dim)
-        self.theta_dim = int(theta_dim)
-        self.convex_widths = validate_widths(convex_widths, "convex_widths")
-        self.hyper_widths = validate_widths(hyper_widths, "hyper_widths")
-        self.seed = int(seed)
-
-        if params is None:
-            key = jax.random.PRNGKey(self.seed)
-            params = init_lpcf_params(
-                key,
-                self.q_dim,
-                self.theta_dim,
-                self.convex_widths,
-                self.hyper_widths,
-            )
-        self.set_params(params)
-
-    def _make_params_template(self) -> params_t:
-        params_template = dict(self.params)
-        params_template.pop("hyper")
-        return params_template
-
-    def set_params(self, params: params_t) -> None:
-        """set model parameters and rebuild compiled helpers."""
-        self.params = params
-        self.params_template = self._make_params_template()
-        self.batched_eval = make_batched_value_and_grad(self.params_template)
-
-    def fit(
-        self,
-        q: np.ndarray,
-        theta: np.ndarray,
-        y: np.ndarray,
-        g: np.ndarray,
-        w: np.ndarray | None = None,
-        lr: float = 1e-3,
-        grad_weight: float = 1.0,
-        l2_reg: float = 0.0,
-        batch_size: int = 128,
-        epochs: int = 200,
-        lr_decay_rate: float = 1.0,
-        lr_decay_steps: int | None = None,
-        q_val: np.ndarray | None = None,
-        theta_val: np.ndarray | None = None,
-        y_val: np.ndarray | None = None,
-        g_val: np.ndarray | None = None,
-        w_val: np.ndarray | None = None,
-        feasibility_data: params_t | None = None,
-    ) -> "MpcPcf":
-        """train the model in place and return self."""
-        self.set_params(
-            train_lpcf(
-                q,
-                theta,
-                y,
-                g,
-                self.q_dim,
-                self.theta_dim,
-                w,
-                self.convex_widths,
-                self.hyper_widths,
-                lr,
-                grad_weight,
-                l2_reg,
-                batch_size,
-                epochs,
-                lr_decay_rate,
-                lr_decay_steps,
-                self.seed,
-                q_val,
-                theta_val,
-                y_val,
-                g_val,
-                w_val,
-                feasibility_data,
-            )
-        )
-        return self
-
-    def value_and_grad(
-        self,
-        q: np.ndarray | jnp.ndarray,
-        theta: np.ndarray | jnp.ndarray,
-    ) -> tuple[jnp.ndarray, jnp.ndarray]:
-        """return batched f(q, theta) and autodiff gradients with respect to q."""
-        return self.batched_eval(
-            self.params["hyper"],
-            jnp.asarray(q, dtype=jnp.float32),
-            jnp.asarray(theta, dtype=jnp.float32),
-        )
-
-    def predict(
-        self,
-        q: np.ndarray | jnp.ndarray,
-        theta: np.ndarray | jnp.ndarray,
-    ) -> jnp.ndarray:
-        """return batched scalar predictions f(q, theta)."""
-        values, _grads = self.value_and_grad(q, theta)
-        return values
-
-    def grad(
-        self,
-        q: np.ndarray | jnp.ndarray,
-        theta: np.ndarray | jnp.ndarray,
-    ) -> jnp.ndarray:
-        """return batched autodiff gradients with respect to q."""
-        _values, grads = self.value_and_grad(q, theta)
-        return grads
-
-    def loss(
-        self,
-        q: np.ndarray | jnp.ndarray,
-        theta: np.ndarray | jnp.ndarray,
-        y: np.ndarray | jnp.ndarray,
-        g: np.ndarray | jnp.ndarray,
-        w: np.ndarray | jnp.ndarray | None = None,
-        grad_weight: float = 1.0,
-        feasibility_data: params_t | None = None,
-    ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-        """evaluate the current value, gradient, and feasibility loss."""
-        qj = jnp.asarray(q, dtype=jnp.float32)
-        if w is None:
-            w = np.ones(qj.shape[0])
-        return loss_fn_from_hyper(
-            self.params_template,
-            self.params["hyper"],
-            qj,
-            jnp.asarray(theta, dtype=jnp.float32),
-            jnp.asarray(y, dtype=jnp.float32),
-            jnp.asarray(g, dtype=jnp.float32),
-            jnp.asarray(w, dtype=jnp.float32),
-            grad_weight,
-            feasibility_data,
-        )
-
-    def to_params(self) -> params_t:
-        """return the underlying parameter dictionary."""
-        return self.params
+def _copy_params(params: Params) -> Params:
+    return jax.tree_util.tree_map(
+        lambda x: x.copy() if hasattr(x, "copy") else x,
+        params,
+    )
 
 
 def train_lpcf(
@@ -582,88 +385,77 @@ def train_lpcf(
     q_dim: int,
     theta_dim: int,
     w: np.ndarray | None = None,
-    convex_widths: Sequence[int] = default_convex_widths,
-    hyper_widths: Sequence[int] = default_hyper_widths,
+    convex_widths: Sequence[int] = convex_widths,
+    hyper_widths: Sequence[int] = hyper_widths,
     lr: float = 1e-3,
+    lr_decay_rate: float = 1.0,
+    lr_decay_steps: int = 1000,
+    selection_metric: str = "objective",
     grad_weight: float = 1.0,
+    value_weight: float = 1.0,
     l2_reg: float = 0.0,
     batch_size: int = 128,
     epochs: int = 200,
-    lr_decay_rate: float = 1.0,
-    lr_decay_steps: int | None = None,
     seed: int = 0,
     q_val: np.ndarray | None = None,
     theta_val: np.ndarray | None = None,
     y_val: np.ndarray | None = None,
     g_val: np.ndarray | None = None,
     w_val: np.ndarray | None = None,
-    feasibility_data: params_t | None = None,
-) -> params_t:
-    """train an lpcf with value and autodiff q-gradient supervision."""
-    if epochs < 0:
-        raise ValueError("epochs must be nonnegative")
-    if lr_decay_rate <= 0.0 or lr_decay_rate > 1.0:
-        raise ValueError("lr_decay_rate must be in (0, 1]")
-    if lr_decay_steps is not None and lr_decay_steps <= 0:
-        raise ValueError("lr_decay_steps must be positive")
+    feasibility_data: Params | None = None,
+) -> Params:
+    """Train an LPCF with value and q-gradient supervision."""
+    key = jax.random.PRNGKey(seed)
     if w is None:
         w = np.ones(q.shape[0])
 
-    key = jax.random.PRNGKey(seed)
-    qj, thetaj, yj, gj, wj = as_training_arrays(
-        q,
-        theta,
-        y,
-        g,
-        q_dim,
-        theta_dim,
-        w,
-    )
+    qj = jnp.asarray(q, dtype=jnp.float32)
+    thetaj = jnp.asarray(theta, dtype=jnp.float32)
+    yj = jnp.asarray(y, dtype=jnp.float32)
+    gj = jnp.asarray(g, dtype=jnp.float32)
+    wj = jnp.asarray(w, dtype=jnp.float32)
 
-    has_validation = (
-        q_val is not None
-        or theta_val is not None
-        or y_val is not None
-        or g_val is not None
-        or w_val is not None
-    )
+    has_validation = q_val is not None or theta_val is not None or y_val is not None or g_val is not None or w_val is not None
     if has_validation:
-        if q_val is None or theta_val is None or y_val is None or g_val is None:
-            raise ValueError("q_val, theta_val, y_val, and g_val must be provided together")
         if w_val is None:
             w_val = np.ones(q_val.shape[0])
-        qvj, thetavj, yvj, gvj, wvj = as_training_arrays(
-            q_val, theta_val, y_val, g_val, q_dim, theta_dim, w_val
-        )
+        qvj = jnp.asarray(q_val, dtype=jnp.float32)
+        thetavj = jnp.asarray(theta_val, dtype=jnp.float32)
+        yvj = jnp.asarray(y_val, dtype=jnp.float32)
+        gvj = jnp.asarray(g_val, dtype=jnp.float32)
+        wvj = jnp.asarray(w_val, dtype=jnp.float32)
 
     params = init_lpcf_params(key, q_dim, theta_dim, convex_widths, hyper_widths)
-    best_params = params
-    best_val = float("inf")
+    best_params = _copy_params(params)
+    best_metric = float("inf")
+    sections = params["sections_static"]
 
-    # if lr_decay_rate < 1.0:
-    #     steps_per_epoch = max(1, int(np.ceil(qj.shape[0] / batch_size)))
-    #     decay_steps = lr_decay_steps or steps_per_epoch
-    learning_rate = optax.exponential_decay(
-        init_value=lr,
-        transition_steps=600,
-        decay_rate=lr_decay_rate,
+    if lr_decay_rate == 1.0:
+        learning_rate = lr
+    else:
+        learning_rate = optax.exponential_decay(
+            init_value=lr,
+            transition_steps=lr_decay_steps,
+            decay_rate=lr_decay_rate,
+            staircase=False,
         )
-    # else:
-    # learning_rate = lr
-
     optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=l2_reg)
     opt_state = optimizer.init(params["hyper"])
-    params_template = dict(params)
-    params_template.pop("hyper")
-    train_step = make_train_step(optimizer, params_template, feasibility_data)
-    eval_step = make_eval_step(params_template, feasibility_data)
+    train_step = make_train_step(optimizer, sections)
+
+    def metric_value(objective, parts):
+        if selection_metric == "value":
+            return float(parts[0])
+        if selection_metric == "grad":
+            return float(parts[1])
+        if selection_metric == "feasibility":
+            return float(parts[2])
+        return float(objective)
 
     for epoch in range(1, epochs + 1):
         batch_key, key = jax.random.split(key)
-        for qb, thetab, yb, gb, wb in batch_iterator(
-            qj, thetaj, yj, gj, wj, batch_size, batch_key
-        ):
-            hyper_params, opt_state, _loss, _vmse, _gmse, _fmse = train_step(
+        for qb, thetab, yb, gb, wb in batch_iterator(qj, thetaj, yj, gj, wj, batch_size, batch_key):
+            params["hyper"], opt_state, _loss, _vmse, _gmse = train_step(
                 params["hyper"],
                 opt_state,
                 qb,
@@ -672,41 +464,73 @@ def train_lpcf(
                 gb,
                 wb,
                 grad_weight,
+                value_weight,
             )
-            params = dict(params)
-            params["hyper"] = hyper_params
 
         if epoch % max(1, epochs // 10) == 0 or epoch == 1:
-            if has_validation:
-                eval_q, eval_theta, eval_y, eval_g, eval_w = qvj, thetavj, yvj, gvj, wvj
-                metric_label = "val"
-            else:
-                eval_q, eval_theta, eval_y, eval_g, eval_w = (
-                    qj[:1024],
-                    thetaj[:1024],
-                    yj[:1024],
-                    gj[:1024],
-                    wj[:1024],
-                )
-                metric_label = "train"
-
-            selection_obj, vm, gm, fm = eval_step(
-                params["hyper"],
-                eval_q,
-                eval_theta,
-                eval_y,
-                eval_g,
-                eval_w,
+            train_obj, train_parts = loss_fn(
+                params,
+                qj,
+                thetaj,
+                yj,
+                gj,
+                wj,
                 grad_weight,
+                value_weight,
+                feasibility_data,
+                l2_reg,
             )
+            eval_obj, eval_parts = train_obj, train_parts
+            val_msg = ""
+            if has_validation:
+                eval_obj, eval_parts = loss_fn(
+                    params,
+                    qvj,
+                    thetavj,
+                    yvj,
+                    gvj,
+                    wvj,
+                    grad_weight,
+                    value_weight,
+                    feasibility_data,
+                    l2_reg,
+                )
+                val_msg = (
+                    f"\n           val value mse: {eval_parts[0]:.4e} "
+                    f"| val grad mse: {eval_parts[1]:.4e} "
+                    f"| val feasibility mse: {eval_parts[2]:.4e}"
+                )
 
-            if float(selection_obj) < best_val:
-                best_val = float(selection_obj)
-                best_params = copy_params(params)
+            metric = metric_value(eval_obj, eval_parts)
+            if metric < best_metric:
+                best_metric = metric
+                best_params = _copy_params(params)
+
             print(
-                f"epoch {epoch:4d} | {metric_label} value mse: {vm:.4e} "
-                f"| {metric_label} grad mse: {gm:.4e} "
-                f"| {metric_label} feasibility mse: {fm:.4e}"
+                f"epoch {epoch:4d}\n"
+                f"           train value mse: {train_parts[0]:.4e} "
+                f"| train grad mse: {train_parts[1]:.4e} "
+                f"| train feasibility mse: {train_parts[2]:.4e}"
+                f"{val_msg}"
             )
 
     return best_params
+
+
+def to_serializable(obj: Any) -> Any:
+    """Recursively convert JAX/NumPy arrays to JSON-serializable values."""
+    if isinstance(obj, (jax.Array, jnp.ndarray, np.ndarray)):
+        return obj.tolist()
+    if isinstance(obj, dict):
+        return {key: to_serializable(value) for key, value in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return [to_serializable(value) for value in obj]
+    return obj
+
+
+def _print_stats(name: str, x: jnp.ndarray) -> None:
+    x = np.asarray(x)
+    print(
+        f"  {name:<18} shape={x.shape} mean={np.mean(x): .3e} "
+        f"std={np.std(x):.3e} min={np.min(x):.3e} max={np.max(x):.3e}"
+    )

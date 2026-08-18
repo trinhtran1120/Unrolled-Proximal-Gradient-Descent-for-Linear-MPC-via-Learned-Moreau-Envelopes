@@ -15,7 +15,7 @@ include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 const SOLVER_NAME = "OSQP"
 const TOL = 1e-3
 const PGM_MAX_ITER = 1000
-const LEARNED_PGM_MAX_ITER = 1000
+const LEARNED_PGM_MAX_ITER = 2000
 const BENCHMARK_SAMPLES = 10
 const EXACT_PGM_RHO = 0.1
 const EXACT_PGM_ADAPTIVE = true

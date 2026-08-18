@@ -16,32 +16,39 @@ project_dir = script_dir.parents[1]
 data_dir = project_dir / "data"
 model_dir = project_dir / "model"
 
-train_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-train_adaptive.npz"
-test_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-test_adaptive.npz"
-model_path = model_dir / "linear-mpc-lpcf001-adaptive"
+train_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-train_fix.npz"
+test_data_path = data_dir / "PGM-rho=0.001_nx=2_N=10-test_fix.npz"
+model_path = model_dir / "linear-mpc-lpcf001-fix"
 
 convex_widths = [16, 16]
 hyper_widths = [64, 64]
 learning_rate = 1e-3
 lr_decay_rate = 0.98
-lr_decay_steps = None
+lr_decay_steps = 10000
 grad_weight = 10.0
-feasibility_weight = 0.01
+value_weight = 1.0
+selection_metric = "grad"
+feasibility_weight = 0.0
 l2_reg = 0.0
-batch_size = 256
+batch_size = 128
 epochs = 3000
 seed = 0
 normalization_eps = 1e-8
 normalize_data = False
-adaptive_step_size = True
+normalize_gamma = False
+normalize_env = True
+adaptive_step_size = False
 
 if str(script_dir) not in sys.path:
     sys.path.insert(0, str(script_dir))
 
 from pcf import (
-    MpcPcf,
+    init_lpcf_params,
+    loss_fn,
+    train_lpcf,
+    to_serializable,
+    value_and_grad,
 )
-from utils_sc import to_serializable  # noqa: E402
 
 
 def _require_fixed_gamma(path: Path, gamma: np.ndarray) -> float:
@@ -95,7 +102,7 @@ def load_dataset(path: Path):
 
         if adaptive_step_size:
             gamma_fixed = float(np.median(gamma))
-            theta = np.hstack((x0, np.log(gamma)[:, None]))
+            theta = np.hstack((x0, gamma[:, None]))
             theta_dim = x0_dim + 1
         else:
             gamma_fixed = _require_fixed_gamma(path, gamma)
@@ -112,8 +119,8 @@ def load_dataset(path: Path):
             "x0_dim": x0_dim,
             "rho_initial": float(data["rho_initial"]),
             "gamma_fixed": gamma_fixed,
-            "gamma_feature": "log_gamma" if adaptive_step_size else "none",
-            "parameter": "x0_log_gamma" if adaptive_step_size else "x0",
+            "gamma_feature": "gamma" if adaptive_step_size else "none",
+            "parameter": "x0_gamma" if adaptive_step_size else "x0",
             "adaptive_data": adaptive,
             "gamma_min": float(np.min(gamma)),
             "gamma_median": float(np.median(gamma)),
@@ -132,27 +139,34 @@ def fit_normalization(
     normalize: bool = normalize_data,
 ) -> dict[str, np.ndarray | float]:
     """fit normalization constants from training data only."""
-    if not normalize:
-        return {
-            "q_mean": np.zeros(q.shape[1]),
-            "q_std": np.ones(q.shape[1]),
-            "theta_mean": np.zeros(theta.shape[1]),
-            "theta_std": np.ones(theta.shape[1]),
-            "env_scale": 1.0,
-        }
+    q_mean = np.zeros(q.shape[1])
+    q_std = np.ones(q.shape[1])
+    theta_mean = np.zeros(theta.shape[1])
+    theta_std = np.ones(theta.shape[1])
+    env_scale = 1.0
 
-    q_mean = q.mean(axis=0)
-    q_std = np.where(q.std(axis=0) < normalization_eps, 1.0, q.std(axis=0))
-    theta_mean = theta.mean(axis=0)
-    theta_std = np.where(
-        theta.std(axis=0) < normalization_eps,
-        1.0,
-        theta.std(axis=0),
-    )
+    if normalize:
+        q_mean = q.mean(axis=0)
+        q_std = np.where(q.std(axis=0) < normalization_eps, 1.0, q.std(axis=0))
+        theta_mean = theta.mean(axis=0)
+        theta_std = np.where(
+            theta.std(axis=0) < normalization_eps,
+            1.0,
+            theta.std(axis=0),
+        )
 
-    env_scale = float(y.std())
-    if env_scale < normalization_eps:
-        env_scale = 1.0
+        env_scale = float(y.std())
+        if env_scale < normalization_eps:
+            env_scale = 1.0
+    elif normalize_gamma and adaptive_step_size:
+        gamma_std = float(theta[:, -1].std())
+        theta_mean[-1] = float(theta[:, -1].mean())
+        theta_std[-1] = 1.0 if gamma_std < normalization_eps else gamma_std
+
+    if normalize_env and not normalize:
+        env_scale = float(y.std())
+        if env_scale < normalization_eps:
+            env_scale = 1.0
 
     return {
         "q_mean": q_mean,
@@ -182,27 +196,6 @@ def apply_normalization(
     y_norm = y / env_scale
     g_norm = g * q_std / env_scale
     return q_norm, theta_norm, y_norm, g_norm
-
-
-def print_normalization_diagnostics(normalization):
-    """print scale factors that map normalized errors back to original units."""
-    q_std = np.asarray(normalization["q_std"])
-    theta_std = np.asarray(normalization["theta_std"])
-    env_scale = float(normalization["env_scale"])
-    grad_scale = env_scale / q_std
-
-    print(f"env scale: {env_scale:.4e}")
-    print(f"q std min/max: {np.min(q_std):.4e} / {np.max(q_std):.4e}")
-    print(
-        "gradient original scale min/median/max: "
-        f"{np.min(grad_scale):.4e} / "
-        f"{np.median(grad_scale):.4e} / "
-        f"{np.max(grad_scale):.4e}"
-    )
-    print(
-        "theta std min/max: "
-        f"{np.min(theta_std):.4e} / {np.max(theta_std):.4e}"
-    )
 
 
 def prediction_matrices(a_matrix: np.ndarray, b_matrix: np.ndarray, horizon: int):
@@ -262,13 +255,10 @@ def make_feasibility_data(metadata, normalization):
         "theta_mean": normalization["theta_mean"],
         "theta_std": normalization["theta_std"],
         "env_scale": normalization["env_scale"],
-        "gradient_scale": float(normalization["env_scale"]) / np.asarray(
-            normalization["q_std"]
-        ),
     }
 
 
-def evaluate(model: MpcPcf, qva, thetava, yva, gva, normalization):
+def evaluate(params, qva, thetava, yva, gva, normalization):
     """compute held-out value and q-gradient mses in original mpc units."""
     qva_norm, thetava_norm, _, _ = apply_normalization(
         qva,
@@ -280,7 +270,8 @@ def evaluate(model: MpcPcf, qva, thetava, yva, gva, normalization):
     q_std = np.asarray(normalization["q_std"])
     env_scale = float(normalization["env_scale"])
 
-    y_pred_norm, g_pred_norm = model.value_and_grad(
+    y_pred_norm, g_pred_norm = value_and_grad(
+        params,
         jnp.asarray(qva_norm),
         jnp.asarray(thetava_norm),
     )
@@ -292,9 +283,10 @@ def evaluate(model: MpcPcf, qva, thetava, yva, gva, normalization):
     return val_mse, grad_mse
 
 
-def evaluate_normalized(model: MpcPcf, qva_norm, thetava_norm, yva_norm, gva_norm):
+def evaluate_normalized(params, qva_norm, thetava_norm, yva_norm, gva_norm):
     """compute held-out value and q-gradient mses in normalized units."""
-    y_pred_norm, g_pred_norm = model.value_and_grad(
+    y_pred_norm, g_pred_norm = value_and_grad(
+        params,
         jnp.asarray(qva_norm),
         jnp.asarray(thetava_norm),
     )
@@ -310,6 +302,8 @@ def prepare_for_export(params, metadata, normalization):
     params = dict(params)
     params["model_type"] = "lpcf"
     params["target"] = "moreau_envelope"
+    params["flatten_order"] = "all_w_all_v_all_omega"
+    params["output_activation"] = params.get("output_activation", "softplus")
     params["gamma_feature"] = metadata["gamma_feature"]
     params["parameter"] = metadata["parameter"]
     params["rho"] = metadata["gamma_fixed"]
@@ -367,13 +361,17 @@ if __name__ == "__main__":
         f"{train_metadata['gamma_max']:.4e}"
     )
     print(f"normalize data: {normalize_data}")
+    print(f"normalize gamma: {normalize_gamma}")
+    print(f"normalize env/grad: {normalize_env}")
     print(f"feasibility weight: {feasibility_weight}")
     print(f"learning rate: {learning_rate}")
     print(f"lr decay rate: {lr_decay_rate}")
+    print(f"value weight: {value_weight}")
+    print(f"grad weight: {grad_weight}")
+    print(f"selection metric: {selection_metric}")
+    print(f"seed: {seed}")
 
     normalization = fit_normalization(qtr, thetatr, ytr, normalize_data)
-    if normalize_data:
-        print_normalization_diagnostics(normalization)
     qtr_norm, thetatr_norm, ytr_norm, gtr_norm = apply_normalization(
         qtr,
         thetatr,
@@ -390,23 +388,30 @@ if __name__ == "__main__":
     )
     feasibility_data = make_feasibility_data(train_metadata, normalization)
 
-    model = MpcPcf(
+    print(f"================ seed {seed} ================")
+    params = init_lpcf_params(
+        jax.random.PRNGKey(seed),
         q_dim=train_metadata["q_dim"],
         theta_dim=train_metadata["theta_dim"],
         convex_widths=convex_widths,
         hyper_widths=hyper_widths,
-        seed=seed,
     )
-    model.fit(
+    params = train_lpcf(
         q=qtr_norm,
         theta=thetatr_norm,
         y=ytr_norm,
         g=gtr_norm,
+        q_dim=train_metadata["q_dim"],
+        theta_dim=train_metadata["theta_dim"],
         w=wtr,
+        convex_widths=convex_widths,
+        hyper_widths=hyper_widths,
         lr=learning_rate,
         lr_decay_rate=lr_decay_rate,
         lr_decay_steps=lr_decay_steps,
+        selection_metric=selection_metric,
         grad_weight=grad_weight,
+        value_weight=value_weight,
         l2_reg=l2_reg,
         batch_size=batch_size,
         epochs=epochs,
@@ -415,12 +420,31 @@ if __name__ == "__main__":
         y_val=yva_norm,
         g_val=gva_norm,
         w_val=wva,
+        seed=seed,
         feasibility_data=feasibility_data,
+    )
+    val_obj, (val_vm, val_gm, val_fm) = loss_fn(
+        params,
+        jnp.asarray(qva_norm, dtype=jnp.float32),
+        jnp.asarray(thetava_norm, dtype=jnp.float32),
+        jnp.asarray(yva_norm, dtype=jnp.float32),
+        jnp.asarray(gva_norm, dtype=jnp.float32),
+        jnp.asarray(wva, dtype=jnp.float32),
+        grad_weight,
+        value_weight,
+        feasibility_data,
+        l2_reg,
+    )
+    print(
+        f"validation obj: {val_obj:.4e} "
+        f"| value mse: {val_vm:.4e} "
+        f"| grad mse: {val_gm:.4e} "
+        f"| feasibility mse: {val_fm:.4e}"
     )
 
     if normalize_data:
         val_mse_norm, grad_mse_norm = evaluate_normalized(
-            model,
+            params,
             qva_norm,
             thetava_norm,
             yva_norm,
@@ -431,10 +455,10 @@ if __name__ == "__main__":
             f"| grad mse: {grad_mse_norm:.4e}"
         )
 
-    val_mse, grad_mse = evaluate(model, qva, thetava, yva, gva, normalization)
+    val_mse, grad_mse = evaluate(params, qva, thetava, yva, gva, normalization)
     print(f"[test original] value mse: {val_mse:.4e} | grad mse: {grad_mse:.4e}")
 
-    save_model(
-        prepare_for_export(model.to_params(), train_metadata, normalization),
-        model_path,
-    )
+    # save_model(
+    #     prepare_for_export(params, train_metadata, normalization),
+    #     model_path,
+    # )

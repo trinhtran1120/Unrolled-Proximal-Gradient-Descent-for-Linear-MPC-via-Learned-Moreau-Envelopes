@@ -1,170 +1,142 @@
-"""Small utility layer for the MPC-specific PCF trainer."""
+"""
+Utility functions for fitting a parametric convex function to data
+and exporting it to cvxpy etc.
 
-from __future__ import annotations
+M. Schaller, A. Bemporad, March 19, 2025
+"""
 
-from typing import Any, Iterator, Sequence
-
+import numpy as np
 import jax
 import jax.numpy as jnp
-import numpy as np
-
-params_t = dict[str, Any]
-batch_t = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
-
-default_convex_widths = (32, 32)
-default_hyper_widths = (64, 64)
-init_scale = 0.05
-
-def act_p(x: jnp.ndarray) -> jnp.ndarray:
-    """Map unconstrained convex-network weights to nonnegative values."""
-    return jax.nn.softplus(x)
+try:
+    from jax_sysid.utils import compute_scores
+except ModuleNotFoundError:
+    compute_scores = None
+from dataclasses import dataclass
+from typing import Callable
+import warnings
 
 
-def activation(x: jnp.ndarray) -> jnp.ndarray:
-    """Convex nondecreasing activation used by the variable network."""
-    return jax.nn.softplus(x)
+@dataclass
+class Activation:
+    jax: Callable
+    cvxpy: Callable
+    convex_increasing: bool
+    
+    
+@dataclass
+class MakePositive:
+    jax: Callable
+    cvxpy: Callable
 
 
-def glorot_uniform(key: jax.Array, shape: tuple[int, int]) -> jnp.ndarray:
-    """Initialize a dense layer with Glorot-uniform weights."""
-    fan_in, fan_out = shape[1], shape[0]
-    limit = jnp.sqrt(6.0 / (fan_in + fan_out))
-    return jax.random.uniform(key, shape, minval=-limit, maxval=limit)
+@dataclass
+class Ind:
+    start: int = 0
+    end: int = 0
 
 
-def validate_widths(widths: Sequence[int], name: str) -> tuple[int, ...]:
-    """Validate hidden-layer widths."""
-    widths = tuple(int(width) for width in widths)
-    if not widths:
-        raise ValueError(f"{name} must contain at least one hidden layer")
-    if any(width <= 0 for width in widths):
-        raise ValueError(f"all {name} entries must be positive")
-    return widths
+@dataclass
+class WeightInd:
+    w: Ind
+    v: Ind
+    o: Ind
 
 
-def copy_params(params: params_t) -> params_t:
-    """Copy a JAX pytree of model parameters."""
-    return jax.tree_util.tree_map(
-        lambda x: x.copy() if hasattr(x, "copy") else x,
-        params,
-    )
+@dataclass
+class Section:
+    start: int = 0
+    end: int = 0
+    shape: tuple = (0, 0)
+    
+
+def _rand(m, n):
+    """Compute a ramdom array of shape (m, n) and entries in [-0.5, 0.5]"""
+    return np.random.rand(m, n) - 0.5
 
 
-def to_serializable(obj: Any) -> Any:
-    """Recursively convert JAX/NumPy arrays to JSON-serializable values."""
-    if isinstance(obj, (jax.Array, jnp.ndarray, np.ndarray)):
-        return obj.tolist()
-    if isinstance(obj, dict):
-        return {key: to_serializable(value) for key, value in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [to_serializable(value) for value in obj]
-    return obj
+def _unsqueeze(x):
+    """If array has shape (n,), turn into array of shape (n, 1)"""
+    if x.ndim == 1:
+        return x.reshape(-1, 1)
+    return x
 
 
-def feasibility_weight(feasibility_data: params_t | None) -> jnp.ndarray:
-    """Return the soft feasibility penalty weight."""
-    if feasibility_data is None:
-        return jnp.array(0.0, dtype=jnp.float32)
-    return jnp.asarray(feasibility_data.get("weight", 0.0), dtype=jnp.float32)
+def _map_matmul(A, b):
+    """Map matrix multiplication with JAX"""
+    
+    return jax.vmap(jnp.matmul)(A, b)
 
 
-def gradient_loss_scale(
-    feasibility_data: params_t | None,
-    dtype: jnp.dtype,
-) -> jnp.ndarray:
-    """Return the scale mapping normalized q-gradients back to original units."""
-    if feasibility_data is None or "gradient_scale" not in feasibility_data:
-        return jnp.asarray(1.0, dtype=dtype)
-    return jnp.asarray(feasibility_data["gradient_scale"], dtype=dtype)
+def _append_section(section, offset, shape, size=None):
+    """Add section in psi output p, such that p[start:end].reshape(shape)
+    is a matrix or vector in main network; returns offset for next section"""
+    
+    if size is None:
+        size = np.prod(shape)
+    section.append(Section(start=offset, end=offset+size, shape=shape))
+    return offset+size
 
 
-def soft_feasibility_penalty(
-    qb: jnp.ndarray,
-    thetab: jnp.ndarray,
-    g_pred: jnp.ndarray,
-    alpha: jnp.ndarray,
-    feasibility_data: params_t | None,
-) -> jnp.ndarray:
-    """Penalize relu(g_matrix u_hat - b(theta)) in original MPC units."""
-    if feasibility_data is None:
-        return jnp.array(0.0, dtype=qb.dtype)
-
-    q_mean = jnp.asarray(feasibility_data["q_mean"], dtype=qb.dtype)
-    q_std = jnp.asarray(feasibility_data["q_std"], dtype=qb.dtype)
-    theta_mean = jnp.asarray(feasibility_data["theta_mean"], dtype=thetab.dtype)
-    theta_std = jnp.asarray(feasibility_data["theta_std"], dtype=thetab.dtype)
-    env_scale = jnp.asarray(feasibility_data["env_scale"], dtype=qb.dtype)
-    g_matrix = jnp.asarray(feasibility_data["g_matrix"], dtype=qb.dtype)
-    b_offset = jnp.asarray(feasibility_data["b_offset"], dtype=qb.dtype)
-    b_theta = jnp.asarray(feasibility_data["b_theta"], dtype=qb.dtype)
-
-    q_original = qb * q_std + q_mean
-    theta_original = thetab * theta_std + theta_mean
-    gamma_feature = feasibility_data.get("gamma_feature", "none")
-    if gamma_feature == "gamma":
-        x0_dim = int(feasibility_data["x0_dim"])
-        x0_original = theta_original[:, :x0_dim]
-        gamma = theta_original[:, x0_dim : x0_dim + 1]
-    elif gamma_feature == "log_gamma":
-        x0_dim = int(feasibility_data["x0_dim"])
-        x0_original = theta_original[:, :x0_dim]
-        gamma = jnp.exp(theta_original[:, x0_dim : x0_dim + 1])
+def _compute_r2(Y, Yhat, return_msg=False):
+    """Compute R2 score for true outputs Y and predicted outputs Yhat"""
+    if compute_scores is None:
+        raise ImportError("_compute_r2 requires jax-sysid")
+    r2, _, msg = compute_scores(Y, Yhat, None, None, fit='R2')
+    r2 = np.mean(r2)
+    if return_msg:
+        return r2, msg
     else:
-        x0_original = theta_original
-        gamma = jnp.asarray(feasibility_data["gamma"], dtype=qb.dtype)
-
-    g_original = g_pred * env_scale / q_std
-    u_hat = q_original - gamma * g_original
-    b_value = b_offset[None, :] + jnp.matmul(x0_original, b_theta.T)
-    violation = jax.nn.relu(jnp.matmul(u_hat, g_matrix.T) - b_value)
-    return jnp.mean(alpha * jnp.sum(violation**2, axis=1))
+        return r2
 
 
-def batch_iterator(
-    q: jnp.ndarray,
-    theta: jnp.ndarray,
-    y: jnp.ndarray,
-    g: jnp.ndarray,
-    w: jnp.ndarray,
-    batch_size: int,
-    shuffle_key: jax.Array,
-) -> Iterator[batch_t]:
-    """Yield shuffled mini-batches."""
-    if batch_size <= 0:
-        raise ValueError("batch_size must be positive")
-
-    permutation = jax.random.permutation(shuffle_key, q.shape[0])
-    for start in range(0, q.shape[0], batch_size):
-        indices = permutation[start : start + batch_size]
-        yield q[indices], theta[indices], y[indices], g[indices], w[indices]
+def _compute_acc(Y, Yhat, return_msg=False):
+    """Compute accuracy for true labls Y and predicted labels Yhat"""
+    if compute_scores is None:
+        raise ImportError("_compute_acc requires jax-sysid")
+    acc, _, msg = compute_scores(Y==-1, Yhat<=0, None, None, fit='Accuracy')
+    acc = np.mean(acc)
+    if return_msg:
+        return acc, msg
+    else:
+        return acc
 
 
-def as_training_arrays(
-    q: np.ndarray,
-    theta: np.ndarray,
-    y: np.ndarray,
-    g: np.ndarray,
-    q_dim: int,
-    theta_dim: int,
-    w: np.ndarray,
-) -> batch_t:
-    """Convert and validate training arrays."""
-    qj = jnp.asarray(q, dtype=jnp.float32)
-    thetaj = jnp.asarray(theta, dtype=jnp.float32)
-    yj = jnp.asarray(y, dtype=jnp.float32)
-    gj = jnp.asarray(g, dtype=jnp.float32)
-    wj = jnp.asarray(w, dtype=jnp.float32)
+def _extract_activations(activation_registry, activation, activation_psi):
+    """Extract activation functions from activation and activation_psi options"""
+    
+    # check that main activation is convex and increasing
+    activation = activation.lower()
+    if not activation_registry[activation].convex_increasing:
+        raise ValueError('Activation function for variable network must'
+                            'be convex and increasing.')
+        
+    # if not specified, make psi activation equal to main activation
+    if activation_psi is None:
+        activation_psi = activation
+    else:
+        activation_psi = activation_psi.lower()
+    
+    # extract main activations
+    act_jax = activation_registry[activation].jax
+    act_cvxpy = activation_registry[activation].cvxpy
+    
+    # extract psi activations
+    act_psi_jax = activation_registry[activation_psi].jax
+    act_psi_cvxpy = activation_registry[activation_psi].cvxpy
+    
+    return act_jax, act_cvxpy, act_psi_jax, act_psi_cvxpy
 
-    if qj.ndim != 2 or qj.shape[1] != q_dim:
-        raise ValueError(f"q must have shape (n, {q_dim})")
-    if thetaj.ndim != 2 or thetaj.shape != (qj.shape[0], theta_dim):
-        raise ValueError(f"theta must have shape (n, {theta_dim})")
-    if yj.shape != (qj.shape[0],):
-        raise ValueError("y must have shape (n,)")
-    if gj.shape != qj.shape:
-        raise ValueError(f"g must have shape (n, {q_dim})")
-    if wj.shape != (qj.shape[0],):
-        raise ValueError("w must have shape (n,)")
-    if np.any(np.asarray(w) <= 0.0):
-        raise ValueError("all w entries must be strictly positive")
-    return qj, thetaj, yj, gj, wj
+
+def _extract_monotonicity(increasing, decreasing):
+    """Extract monotonicity multiplier from increasing/decreasing options"""
+    
+    if increasing and decreasing:
+        warnings.warn("\033[1mFunction enforced to be both increasing and decreasing.\033[0m")
+        return 0
+    elif increasing:
+        return 1
+    elif decreasing:
+        return -1
+    else:
+        return None

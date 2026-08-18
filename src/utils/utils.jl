@@ -19,6 +19,8 @@ struct LearnedPCF
     theta_std::Vector{Float64}
     env_scale::Float64
     target::String
+    flatten_order::String
+    output_activation::String
 end
 
 
@@ -73,6 +75,8 @@ function load_learned_pcf(path::AbstractString)
         json_vector(normalization["theta_std"]),
         Float64(normalization["env_scale"]),
         String(data["target"]),
+        haskey(data, :flatten_order) ? String(data["flatten_order"]) : "interleaved",
+        haskey(data, :output_activation) ? String(data["output_activation"]) : "identity",
     )
 end
 
@@ -116,6 +120,14 @@ end
 
 
 function unpack_pcf_weights(model::LearnedPCF, emitted::AbstractVector)
+    if model.flatten_order == "all_w_all_v_all_omega"
+        return unpack_pcf_weights_all_w_all_v_all_omega(model, emitted)
+    end
+    return unpack_pcf_weights_interleaved(model, emitted)
+end
+
+
+function unpack_pcf_weights_interleaved(model::LearnedPCF, emitted::AbstractVector)
     offset = 1
     shape_idx = 1
     W = Matrix{Float64}[]
@@ -154,7 +166,68 @@ function unpack_pcf_weights(model::LearnedPCF, emitted::AbstractVector)
     shape = model.shapes[shape_idx]
     omega_out = take_vector(emitted, offset, shape[1])
 
-    return (W = W, V = V, omega = omega, W_out = W_out, V_out = V_out, omega_out = omega_out)
+    return (
+        W = W,
+        V = V,
+        omega = omega,
+        W_out = W_out,
+        V_out = V_out,
+        omega_out = omega_out,
+    )
+end
+
+
+function unpack_pcf_weights_all_w_all_v_all_omega(model::LearnedPCF, emitted::AbstractVector)
+    offset = 1
+    shape_idx = 1
+    W = Matrix{Float64}[]
+    V = Matrix{Float64}[]
+    omega = Vector{Float64}[]
+
+    for layer_idx in 1:length(model.convex_widths)
+        if layer_idx > 1
+            shape = model.shapes[shape_idx]
+            push!(W, take_row_major_matrix(emitted, offset, shape[1], shape[2]))
+            offset += prod(shape)
+            shape_idx += 1
+        end
+    end
+
+    shape = model.shapes[shape_idx]
+    W_out = take_row_major_matrix(emitted, offset, shape[1], shape[2])
+    offset += prod(shape)
+    shape_idx += 1
+
+    for layer_idx in 1:length(model.convex_widths)
+        shape = model.shapes[shape_idx]
+        push!(V, take_row_major_matrix(emitted, offset, shape[1], shape[2]))
+        offset += prod(shape)
+        shape_idx += 1
+    end
+
+    shape = model.shapes[shape_idx]
+    V_out = take_row_major_matrix(emitted, offset, shape[1], shape[2])
+    offset += prod(shape)
+    shape_idx += 1
+
+    for _layer_idx in 1:length(model.convex_widths)
+        shape = model.shapes[shape_idx]
+        push!(omega, take_vector(emitted, offset, shape[1]))
+        offset += prod(shape)
+        shape_idx += 1
+    end
+
+    shape = model.shapes[shape_idx]
+    omega_out = take_vector(emitted, offset, shape[1])
+
+    return (
+        W = W,
+        V = V,
+        omega = omega,
+        W_out = W_out,
+        V_out = V_out,
+        omega_out = omega_out,
+    )
 end
 
 
@@ -178,8 +251,15 @@ function pcf_value_and_grad_normalized(
     end
 
     W_out = vec(softplus.(weights.W_out[1, :]))
-    value = dot(W_out, z) + dot(vec(weights.V_out[1, :]), q_norm) + weights.omega_out[1]
-    grad_q = W_out' * dz_dq .+ vec(weights.V_out[1, :])'
+    raw_value = dot(W_out, z) + dot(vec(weights.V_out[1, :]), q_norm) + weights.omega_out[1]
+    raw_grad_q = W_out' * dz_dq .+ vec(weights.V_out[1, :])'
+    if model.output_activation == "softplus"
+        value = softplus(raw_value)
+        grad_q = sigmoid(raw_value) .* raw_grad_q
+    else
+        value = raw_value
+        grad_q = raw_grad_q
+    end
     return value, vec(grad_q)
 end
 
