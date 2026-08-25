@@ -1,281 +1,185 @@
 from __future__ import annotations
 
-from functools import partial
 from typing import Any, Iterator, Sequence
 
 import jax
+
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import numpy as np
 import optax
 
-from utils import (
-    Batch,
-    Params,
-    Section,
-    _copy_params,
-    _init_psi_params,
-    _make_positive,
-    _make_sections,
-    _to_serializable,
-)
+from utils import Params, _copy_params, _rand_uniform, _to_serializable
 
-convex_widths = (32, 32)
-hyper_widths = (64, 64)
-
-
-def _activation(x: jnp.ndarray) -> jnp.ndarray:
-    """Convex nondecreasing activation"""
-    return jax.nn.softplus(x)
-
-
-def _output(x: jnp.ndarray) -> jnp.ndarray:
-    """Nonnegative output"""
-    return jax.nn.softplus(x)
+hidden_widths = (64, 64)
+dtype = jnp.float64
 
 
 def init(
     key: jax.Array,
     input_dim: int,
     parameter_dim: int,
-    convex_widths: Sequence[int] = convex_widths,
-    hyper_widths: Sequence[int] = hyper_widths,
+    output_dim: int,
+    widths: Sequence[int] = hidden_widths,
 ) -> Params:
-    """Initialize PCF metadata and trainable psi parameters."""
-    convex_widths = tuple(int(width) for width in convex_widths)
-    hyper_widths = tuple(int(width) for width in hyper_widths)
+    """Initialize a standard MLP for h_theta(U, x0) = [V_hat; s_hat]."""
+    dims = (int(input_dim + parameter_dim), *tuple(int(w) for w in widths), int(output_dim))
+    keys = jax.random.split(key, 2 * (len(dims) - 1))
+    weights = []
+    biases = []
 
-    key_psi, _ = jax.random.split(key)
-    layer_dims, sections, output_dim = _make_sections(input_dim, convex_widths)
-    shapes = tuple(
-        [section[2] for section in sections["W"]]
-        + [section[2] for section in sections["V"]]
-        + [section[2] for section in sections["omega"]]
-    )
-    sections = (sections["W"], sections["V"], sections["omega"])
+    for layer_idx in range(len(dims) - 1):
+        weights.append(_rand_uniform(keys[2 * layer_idx], (dims[layer_idx + 1], dims[layer_idx])))
+        weights[-1] = weights[-1].astype(dtype)
+        biases.append(jnp.zeros((dims[layer_idx + 1],), dtype=dtype))
 
     return {
         "input_dim": int(input_dim),
         "parameter_dim": int(parameter_dim),
-        "convex_widths": convex_widths,
-        "hyper_widths": hyper_widths,
-        "layer_dims": layer_dims,
-        "sections": sections,
-        "shapes": shapes,
         "output_dim": int(output_dim),
-        "hyper": _init_psi_params(key_psi, parameter_dim, hyper_widths, output_dim),
+        "widths": tuple(int(w) for w in widths),
+        "weights": weights,
+        "biases": biases,
     }
 
 
-@jax.jit
-def _psi(parameter: jnp.ndarray, hyper: Params) -> jnp.ndarray:
-    """Evaluate psi(parameter), matching the residual/feedforward form in pcf_sc."""
-    W_psi, V_psi, omega_psi = hyper["W_psi"], hyper["V_psi"], hyper["omega_psi"]
-    out = jnp.dot(V_psi[0], parameter) + omega_psi[0]
-    for layer_idx in range(1, len(V_psi)):
-        out = _activation(out)
-        out = (
-            jnp.dot(W_psi[layer_idx - 1], out)
-            + jnp.dot(V_psi[layer_idx], parameter)
-            + omega_psi[layer_idx]
-        )
-    return out.reshape(-1)
+def forward(params: Params, model_input: jnp.ndarray, parameter: jnp.ndarray) -> jnp.ndarray:
+    """Evaluate raw [V_hat; s_hat] predictions."""
+    z = jnp.concatenate((model_input, parameter), axis=-1)
+    for W, b in zip(params["weights"][:-1], params["biases"][:-1]):
+        z = jnp.tanh(z @ W.T + b)
+    return z @ params["weights"][-1].T + params["biases"][-1]
 
 
-@partial(jax.jit, static_argnames=("sections",))
-def unpack(
-    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
-    emitted: jnp.ndarray,
-) -> Params:
-    """Unpack psi(parameter)'s flat vector into main ICNN tensors."""
-    tensors: Params = {"W": [], "V": [], "omega": []}
-    sections_w, sections_v, sections_o = sections
-    for start, end, shape in sections_w:
-        raw = emitted[start:end].reshape(shape)
-        fan_in = shape[1]
-        tensors["W"].append(_make_positive(raw) / fan_in)
-    for start, end, shape in sections_v:
-        fan_in = shape[1]
-        tensors["V"].append(emitted[start:end].reshape(shape) / np.sqrt(fan_in))
-    for start, end, shape in sections_o:
-        tensors["omega"].append(emitted[start:end].reshape(shape))
-    return tensors
+def predict(params: Params, model_input: jnp.ndarray, parameter: jnp.ndarray) -> jnp.ndarray:
+    return jax.vmap(forward, in_axes=(None, 0, 0))(params, model_input, parameter)
 
 
-@partial(jax.jit, static_argnames=("sections",))
-def forward(
-    hyper: Params,
-    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
-    model_input: jnp.ndarray,
+def _constraint_parameter(parameter: jnp.ndarray, feasibility_data: Params) -> jnp.ndarray:
+    if "parameter_mean" not in feasibility_data or "parameter_std" not in feasibility_data:
+        return parameter
+    mean = jnp.asarray(feasibility_data["parameter_mean"], dtype=parameter.dtype)
+    std = jnp.asarray(feasibility_data["parameter_std"], dtype=parameter.dtype)
+    return parameter * std + mean
+
+
+def state_constraint_rhs(parameter: jnp.ndarray, b_offset: jnp.ndarray, b_theta: jnp.ndarray) -> jnp.ndarray:
+    return b_offset + parameter[..., : b_theta.shape[1]] @ b_theta.T
+
+
+def affine_projection_layer(
+    z_hat: jnp.ndarray,
     parameter: jnp.ndarray,
-) -> jnp.ndarray:
-    """Evaluate the scalar PCF output for one ``(model_input, parameter)`` pair."""
-    emitted = _psi(parameter, hyper)
-    tensors = unpack(sections, emitted)
-    W, V, omega = tensors["W"], tensors["V"], tensors["omega"]
-
-    z = _activation(jnp.dot(V[0], model_input) + omega[0])
-    for layer_idx in range(1, len(V) - 1):
-        z = _activation(
-            jnp.dot(W[layer_idx - 1], z)
-            + jnp.dot(V[layer_idx], model_input)
-            + omega[layer_idx]
-        )
-
-    output_raw = (
-        jnp.dot(W[-1], z).squeeze()
-        + jnp.dot(V[-1], model_input).squeeze()
-        + omega[-1].squeeze()
-    )
-    return _output(output_raw)
-
-
-@partial(jax.jit, static_argnames=("sections",))
-def value_and_grad(
-    hyper: Params,
-    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
-    model_input: jnp.ndarray,
-    parameter: jnp.ndarray,
+    g_matrix: jnp.ndarray,
+    b_offset: jnp.ndarray,
+    b_theta: jnp.ndarray,
+    parameter_mean: jnp.ndarray | None = None,
+    parameter_std: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    """Evaluate batched values and model_input-gradients."""
-    values = jax.vmap(forward, in_axes=(None, None, 0, 0))(
-        hyper, sections, model_input, parameter
-    )
-    grads = jax.vmap(
-        jax.grad(forward, argnums=2),
-        in_axes=(None, None, 0, 0),
-    )(hyper, sections, model_input, parameter)
-    return values, grads
+    """Project raw [V; s] predictions onto Gx V + s = b(x0)."""
+    input_dim = g_matrix.shape[1]
+    slack_dim = g_matrix.shape[0]
+    if z_hat.shape[-1] != input_dim + slack_dim:
+        raise ValueError(f"z_hat last dimension is {z_hat.shape[-1]}; expected {input_dim + slack_dim}")
+
+    v_hat = z_hat[..., :input_dim]
+    s_hat = z_hat[..., input_dim:]
+    parameter_for_b = parameter
+    if parameter_mean is not None and parameter_std is not None:
+        parameter_for_b = parameter * parameter_std + parameter_mean
+    b = state_constraint_rhs(parameter_for_b, b_offset, b_theta)
+    residual = v_hat @ g_matrix.T + s_hat - b
+    ee_t = g_matrix @ g_matrix.T + jnp.eye(slack_dim, dtype=z_hat.dtype)
+    correction = jnp.linalg.solve(ee_t, residual[..., None])[..., 0]
+    v_tilde = v_hat - correction @ g_matrix
+    s_tilde = s_hat - correction
+    return v_tilde, s_tilde
 
 
-class PCF:
-    def __init__(self, params: Params):
-        self.params = params
-
-    def __call__(self, model_input: np.ndarray, parameter: np.ndarray) -> jnp.ndarray:
-        values, _ = self.value_and_grad(model_input, parameter)
-        return values
-
-    def predict(self, model_input: np.ndarray, parameter: np.ndarray) -> jnp.ndarray:
-        values, _ = self.value_and_grad(model_input, parameter)
-        return values
-
-    def grad(self, model_input: np.ndarray, parameter: np.ndarray) -> jnp.ndarray:
-        _, grads = self.value_and_grad(model_input, parameter)
-        return grads
-
-    def value_and_grad(self, model_input: np.ndarray, parameter: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
-        return value_and_grad(
-            self.params["hyper"],
-            self.params["sections"],
-            jnp.asarray(model_input, dtype=jnp.float32),
-            jnp.asarray(parameter, dtype=jnp.float32),
-        )
-
-    def to_dict(self) -> Params:
-        return self.params
-
-    def to_jsonable(self) -> Any:
-        return _to_serializable(self.params)
-
-
-def loss(
-    hyper: Params,
-    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
+def projection_loss(
+    params: Params,
     model_input: jnp.ndarray,
     parameter: jnp.ndarray,
-    y: jnp.ndarray,
-    g: jnp.ndarray,
-    w: jnp.ndarray,
+    projection: jnp.ndarray,
+    weights: jnp.ndarray,
     feasibility_data: Params,
-    grad_weight: float = 1.0,
-    value_weight: float = 1.0,
-    feasibility_weight: float = 0.0,
+    eq_weight: float = 1.0,
+    slack_positive_weight: float = 1.0,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-    """Return total loss and value/gradient/feasibility components."""
-    y_pred, g_pred = value_and_grad(hyper, sections, model_input, parameter)
-    normalized_weights = w / jnp.maximum(jnp.mean(w), 1e-12)
+    """Loss from the learned neural projection section of the paper."""
+    z_hat = predict(params, model_input, parameter)
+    input_dim = projection.shape[1]
+    v_hat = z_hat[:, :input_dim]
+    s_hat = z_hat[:, input_dim:]
 
-    value_mse = jnp.mean(normalized_weights * (y_pred - y) ** 2)
-    grad_mse = jnp.mean(normalized_weights * jnp.sum((g_pred - g) ** 2, axis=1))
-
-    input_mean = jnp.asarray(feasibility_data["input_mean"], dtype=model_input.dtype)
-    input_std = jnp.asarray(feasibility_data["input_std"], dtype=model_input.dtype)
-    parameter_mean = jnp.asarray(feasibility_data["parameter_mean"], dtype=parameter.dtype)
-    parameter_std = jnp.asarray(feasibility_data["parameter_std"], dtype=parameter.dtype)
-    env_scale = jnp.asarray(feasibility_data["env_scale"], dtype=model_input.dtype)
-    gamma = jnp.asarray(feasibility_data["gamma"], dtype=model_input.dtype)
-    input_orig = model_input * input_std + input_mean
-    grad_orig = g_pred * env_scale / input_std
-    parameter_orig = parameter * parameter_std + parameter_mean
-    parameter_part = parameter_orig[:, : int(feasibility_data["parameter_dim"])]
-    gamma_factor = gamma[:, None] if jnp.ndim(gamma) else gamma
     g_matrix = jnp.asarray(feasibility_data["g_matrix"], dtype=model_input.dtype)
     b_offset = jnp.asarray(feasibility_data["b_offset"], dtype=model_input.dtype)
-    b_theta = jnp.asarray(feasibility_data["b_theta"], dtype=model_input.dtype)
-    violation = (input_orig - gamma_factor * grad_orig) @ g_matrix.T - (
-        b_offset[None, :] + parameter_part @ b_theta.T
-    )
-    feas_mse = jnp.mean(jax.nn.relu(violation) ** 2)
+    b_theta = jnp.asarray(feasibility_data["b_theta"], dtype=parameter.dtype)
+    parameter_for_b = _constraint_parameter(parameter, feasibility_data)
+    b = state_constraint_rhs(parameter_for_b, b_offset, b_theta)
+    normalized_weights = weights / jnp.maximum(jnp.mean(weights), 1e-12)
 
-    objective = value_weight * value_mse + grad_weight * grad_mse + feasibility_weight * feas_mse
-    return objective, (value_mse, grad_mse, feas_mse)
+    projection_mse = jnp.mean(normalized_weights * jnp.sum((v_hat - projection) ** 2, axis=1))
+    equality_mse = jnp.mean(normalized_weights * jnp.sum((v_hat @ g_matrix.T + s_hat - b) ** 2, axis=1))
+    slack_mse = jnp.mean(normalized_weights * jnp.sum(jax.nn.relu(-s_hat) ** 2, axis=1))
+    objective = projection_mse + eq_weight * equality_mse + slack_positive_weight * slack_mse
+    return objective, (projection_mse, equality_mse, slack_mse)
+
+
+def corrected_projection(
+    params: Params,
+    model_input: jnp.ndarray,
+    parameter: jnp.ndarray,
+    feasibility_data: Params,
+) -> tuple[jnp.ndarray, jnp.ndarray]:
+    """Run h_theta and then the closed-form affine projection layer."""
+    z_hat = predict(params, model_input, parameter)
+    return affine_projection_layer(
+        z_hat,
+        parameter,
+        jnp.asarray(feasibility_data["g_matrix"], dtype=model_input.dtype),
+        jnp.asarray(feasibility_data["b_offset"], dtype=model_input.dtype),
+        jnp.asarray(feasibility_data["b_theta"], dtype=parameter.dtype),
+        jnp.asarray(feasibility_data["parameter_mean"], dtype=parameter.dtype)
+        if "parameter_mean" in feasibility_data
+        else None,
+        jnp.asarray(feasibility_data["parameter_std"], dtype=parameter.dtype)
+        if "parameter_std" in feasibility_data
+        else None,
+    )
 
 
 def _batches(
     model_input: jnp.ndarray,
     parameter: jnp.ndarray,
-    y: jnp.ndarray,
-    g: jnp.ndarray,
-    w: jnp.ndarray,
+    projection: jnp.ndarray,
+    weights: jnp.ndarray,
     batch_size: int,
     shuffle_key: jax.Array,
-) -> Iterator[Batch]:
-    """Yield shuffled mini-batches."""
+) -> Iterator[tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
     permutation = jax.random.permutation(shuffle_key, model_input.shape[0])
     for start in range(0, model_input.shape[0], batch_size):
         indices = permutation[start : start + batch_size]
-        yield model_input[indices], parameter[indices], y[indices], g[indices], w[indices]
+        yield model_input[indices], parameter[indices], projection[indices], weights[indices]
 
 
-def _step_fn(
-    optimizer: optax.GradientTransformation,
-    sections: tuple[tuple[Section, ...], tuple[Section, ...], tuple[Section, ...]],
-    feasibility_data: Params,
-    feasibility_weight: float,
-):
-    """Build one JIT-compiled optimizer step."""
-
+def _step_fn(optimizer: optax.GradientTransformation, feasibility_data: Params, eq_weight: float, slack_positive_weight: float):
     @jax.jit
-    def train_step(
-        hyper: Params,
-        opt_state: optax.OptState,
-        input_b: jnp.ndarray,
-        parameter_b: jnp.ndarray,
-        yb: jnp.ndarray,
-        gb: jnp.ndarray,
-        wb: jnp.ndarray,
-        grad_weight: float,
-        value_weight: float,
-    ):
-        (objective, (vmse, gmse, fmse)), grads = jax.value_and_grad(
-            loss,
-            has_aux=True,
-        )(
-            hyper,
-            sections,
+    def train_step(params, opt_state, input_b, parameter_b, projection_b, weights_b):
+        (objective, parts), grads = jax.value_and_grad(projection_loss, has_aux=True)(
+            params,
             input_b,
             parameter_b,
-            yb,
-            gb,
-            wb,
+            projection_b,
+            weights_b,
             feasibility_data,
-            grad_weight,
-            value_weight,
-            feasibility_weight,
+            eq_weight,
+            slack_positive_weight,
         )
-        updates, opt_state = optimizer.update(grads, opt_state, hyper)
-        hyper = optax.apply_updates(hyper, updates)
-        return hyper, opt_state, objective, vmse, gmse, fmse
+        updates, opt_state = optimizer.update(grads, opt_state, params)
+        params = optax.apply_updates(params, updates)
+        return params, opt_state, objective, parts
 
     return train_step
 
@@ -283,151 +187,145 @@ def _step_fn(
 def train(
     model_input: np.ndarray,
     parameter: np.ndarray,
-    y: np.ndarray,
-    g: np.ndarray,
+    projection: np.ndarray,
     input_dim: int,
     parameter_dim: int,
     feasibility_data: Params,
     w: np.ndarray | None = None,
-    convex_widths: Sequence[int] = convex_widths,
-    hyper_widths: Sequence[int] = hyper_widths,
+    widths: Sequence[int] = hidden_widths,
     lr: float = 1e-3,
     lr_decay_rate: float = 1.0,
     lr_decay_steps: int = 1000,
     selection_metric: str = "objective",
-    grad_weight: float = 1.0,
-    value_weight: float = 1.0,
+    eq_weight: float = 1.0,
+    slack_positive_weight: float = 1.0,
     l2_reg: float = 0.0,
     batch_size: int = 128,
     epochs: int = 200,
     seed: int = 0,
     input_val: np.ndarray | None = None,
     parameter_val: np.ndarray | None = None,
-    y_val: np.ndarray | None = None,
-    g_val: np.ndarray | None = None,
+    projection_val: np.ndarray | None = None,
     w_val: np.ndarray | None = None,
-    feasibility_weight: float = 0.0,
     eval_interval: int = 50,
 ) -> Params:
-    """Train an PCF with value and model_input-gradient supervision."""
+    """Train a projection MLP with equality/slack penalties from the paper."""
     key = jax.random.PRNGKey(seed)
     if w is None:
         w = np.ones(model_input.shape[0])
 
-    input_j = jnp.asarray(model_input, dtype=jnp.float32)
-    parameter_j = jnp.asarray(parameter, dtype=jnp.float32)
-    yj = jnp.asarray(y, dtype=jnp.float32)
-    gj = jnp.asarray(g, dtype=jnp.float32)
-    wj = jnp.asarray(w, dtype=jnp.float32)
+    input_j = jnp.asarray(model_input, dtype=dtype)
+    parameter_j = jnp.asarray(parameter, dtype=dtype)
+    projection_j = jnp.asarray(projection, dtype=dtype)
+    wj = jnp.asarray(w, dtype=dtype)
 
-    has_validation = all(v is not None for v in (input_val, parameter_val, y_val, g_val))
+    has_validation = all(v is not None for v in (input_val, parameter_val, projection_val))
     if has_validation:
         if w_val is None:
             w_val = np.ones(input_val.shape[0])
-        input_vj = jnp.asarray(input_val, dtype=jnp.float32)
-        parameter_vj = jnp.asarray(parameter_val, dtype=jnp.float32)
-        yvj = jnp.asarray(y_val, dtype=jnp.float32)
-        gvj = jnp.asarray(g_val, dtype=jnp.float32)
-        wvj = jnp.asarray(w_val, dtype=jnp.float32)
+        input_vj = jnp.asarray(input_val, dtype=dtype)
+        parameter_vj = jnp.asarray(parameter_val, dtype=dtype)
+        projection_vj = jnp.asarray(projection_val, dtype=dtype)
+        wvj = jnp.asarray(w_val, dtype=dtype)
 
-    params = init(key, input_dim, parameter_dim, convex_widths, hyper_widths)
-    best_params = _copy_params(params)
+    output_dim = int(input_dim + feasibility_data["g_matrix"].shape[0])
+    params = init(key, input_dim, parameter_dim, output_dim, widths)
+    trainable_params = {"weights": params["weights"], "biases": params["biases"]}
+    model_metadata = {
+        "input_dim": params["input_dim"],
+        "parameter_dim": params["parameter_dim"],
+        "output_dim": params["output_dim"],
+        "widths": params["widths"],
+    }
+    best_trainable_params = _copy_params(trainable_params)
     best_metric = float("inf")
-    sections = params["sections"]
 
     if lr_decay_rate == 1.0:
         learning_rate = lr
     else:
-        learning_rate = optax.exponential_decay(
-            init_value=lr,
-            transition_steps=lr_decay_steps,
-            decay_rate=lr_decay_rate,
-            staircase=False,
-        )
+        learning_rate = optax.exponential_decay(lr, lr_decay_steps, lr_decay_rate, staircase=False)
     optimizer = optax.adamw(learning_rate=learning_rate, weight_decay=l2_reg)
-    opt_state = optimizer.init(params["hyper"])
-    train_step = _step_fn(optimizer, sections, feasibility_data, feasibility_weight)
+    opt_state = optimizer.init(trainable_params)
+    train_step = _step_fn(optimizer, feasibility_data, eq_weight, slack_positive_weight)
     eval_interval = max(1, int(eval_interval))
 
     def metric_value(objective, parts):
-        if selection_metric == "value":
+        if selection_metric == "projection":
             return float(parts[0])
-        if selection_metric == "grad":
+        if selection_metric == "equality":
             return float(parts[1])
-        if selection_metric == "feasibility":
+        if selection_metric == "slack":
             return float(parts[2])
         return float(objective)
 
     for epoch in range(1, epochs + 1):
         batch_key, key = jax.random.split(key)
-        for input_b, parameter_b, yb, gb, wb in _batches(input_j, parameter_j, yj, gj, wj, batch_size, batch_key):
-            params["hyper"], opt_state, _objective, _vmse, _gmse, _fmse = train_step(
-                params["hyper"],
+        for input_b, parameter_b, projection_b, weights_b in _batches(input_j, parameter_j, projection_j, wj, batch_size, batch_key):
+            trainable_params, opt_state, _objective, _parts = train_step(
+                trainable_params,
                 opt_state,
                 input_b,
                 parameter_b,
-                yb,
-                gb,
-                wb,
-                grad_weight,
-                value_weight,
+                projection_b,
+                weights_b,
             )
 
         if epoch == 1 or epoch % eval_interval == 0 or epoch == epochs:
-            train_obj, train_parts = loss(
-                params["hyper"],
-                params["sections"],
-                input_j,
-                parameter_j,
-                yj,
-                gj,
-                wj,
-                feasibility_data,
-                grad_weight,
-                value_weight,
-                feasibility_weight,
+            train_obj, train_parts = projection_loss(
+                trainable_params, input_j, parameter_j, projection_j, wj, feasibility_data, eq_weight, slack_positive_weight
             )
             eval_obj, eval_parts = train_obj, train_parts
             val_msg = ""
             if has_validation:
-                eval_obj, eval_parts = loss(
-                    params["hyper"],
-                    params["sections"],
+                eval_obj, eval_parts = projection_loss(
+                    trainable_params,
                     input_vj,
                     parameter_vj,
-                    yvj,
-                    gvj,
+                    projection_vj,
                     wvj,
                     feasibility_data,
-                    grad_weight,
-                    value_weight,
-                    feasibility_weight,
+                    eq_weight,
+                    slack_positive_weight,
                 )
                 val_msg = (
-                    f"\n           val value mse: {eval_parts[0]:.4e} "
-                    f"| val grad mse: {eval_parts[1]:.4e} "
-                    f"| val feasibility mse: {eval_parts[2]:.4e}"
+                    f"\n           val projection mse: {eval_parts[0]:.4e} "
+                    f"| val equality mse: {eval_parts[1]:.4e} "
+                    f"| val slack mse: {eval_parts[2]:.4e}"
                 )
 
             metric = metric_value(eval_obj, eval_parts)
             if metric < best_metric:
                 best_metric = metric
-                best_params = _copy_params(params)
+                best_trainable_params = _copy_params(trainable_params)
 
             print(
                 f"epoch {epoch:4d}\n"
-                f"           train value mse: {train_parts[0]:.4e} "
-                f"| train grad mse: {train_parts[1]:.4e} "
-                f"| train feasibility mse: {train_parts[2]:.4e}"
+                f"           train projection mse: {train_parts[0]:.4e} "
+                f"| train equality mse: {train_parts[1]:.4e} "
+                f"| train slack mse: {train_parts[2]:.4e}"
                 f"{val_msg}"
             )
 
-    return best_params
+    return {**model_metadata, **best_trainable_params}
 
 
-def _print_stats(name: str, x: jnp.ndarray) -> None:
-    x = np.asarray(x)
-    print(
-        f"  {name:<18} shape={x.shape} mean={np.mean(x): .3e} "
-        f"std={np.std(x):.3e} min={np.min(x):.3e} max={np.max(x):.3e}"
-    )
+class ProjectionMLP:
+    def __init__(self, params: Params):
+        self.params = params
+
+    def __call__(self, model_input: np.ndarray, parameter: np.ndarray) -> jnp.ndarray:
+        return predict(self.params, jnp.asarray(model_input, dtype=dtype), jnp.asarray(parameter, dtype=dtype))
+
+    def corrected(self, model_input: np.ndarray, parameter: np.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
+        return corrected_projection(
+            self.params,
+            jnp.asarray(model_input, dtype=dtype),
+            jnp.asarray(parameter, dtype=dtype),
+            self.params["feasibility"],
+        )
+
+    def to_dict(self) -> Params:
+        return self.params
+
+    def to_jsonable(self) -> Any:
+        return _to_serializable(self.params)

@@ -1,16 +1,32 @@
 using LinearAlgebra
-using JuMP
-using Gurobi
-import MathOptInterface as MOI
 
 include("pgm.jl")
 include(joinpath(@__DIR__, "..", "utils", "utils.jl"))
 
 
-function learned_grad(model::LearnedPCF, system::LinearMPC, q::Matrix{Float64}, x0::Vector{Float64})
-    input = vec(q)
-    grad = pcf_grad(model, input, x0)
+function learned_moreau_value(model::ProjectionMLP, U::Matrix{Float64}, x0::Vector{Float64})
+    V_tilde, _ = projection_mlp_corrected(model, vec(U), x0)
+    d = vec(U) .- V_tilde
+    return dot(d, d) / (2 * model.rho)
+end
+
+
+function learned_moreau_gradient(model::ProjectionMLP, system::LinearMPC, U::Matrix{Float64}, x0::Vector{Float64})
+    size(U) == (system.nu, system.N) ||
+        throw(DimensionMismatch("U has size $(size(U)); expected $((system.nu, system.N))"))
+    length(x0) == system.nx ||
+        throw(DimensionMismatch("x0 has length $(length(x0)); expected $(system.nx)"))
+
+    grad = projection_mlp_gradient(model, vec(U), x0)
     return reshape(grad, system.nu, system.N)
+end
+
+
+function learned_objective_gradient(model::ProjectionMLP, system::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
+    cost, cost_grad = evaluate_cost_gradient(system, x0, U)
+    moreau_value = learned_moreau_value(model, U, x0)
+    moreau_grad = learned_moreau_gradient(model, system, U, x0)
+    return cost + moreau_value, cost_grad .+ moreau_grad
 end
 
 
@@ -21,10 +37,8 @@ end
 
 function backtrack_stepsize!(
     gamma::R,
-    model::LearnedPCF,
+    model::ProjectionMLP,
     system::LinearMPC,
-    project,
-    refine::Bool,
     x0::Vector{Float64},
     U::Matrix{Float64},
     f_U::R,
@@ -36,39 +50,23 @@ function backtrack_stepsize!(
     reduce_gamma::R = R(0.5),
 ) where {R}
     @. q = U - gamma * grad_U
-    grad_g = learned_grad(model, system, q, x0)
-    @. U_next = q - grad_g
-    refine_residual = 0.0
-    projection_solve_time = 0.0
-    if refine
-        refine_input = copy(U_next)
-        projected_U, project_time = project(x0, refine_input)
-        copyto!(U_next, projected_U)
-        projection_solve_time += project_time
-        refine_residual = norm(refine_input - U_next, Inf)
-    end
+    @. U_next = clamp(q, system.umin, system.umax)
     @. res = U - U_next
 
-    f_next, _ = evaluate_cost_gradient(system, x0, U_next)
+    f_next, _ = learned_objective_gradient(model, system, x0, U_next)
     f_next_upper = f_model(f_U, grad_U, res, gamma)
     tol = 10 * eps(R) * (1 + abs(f_next))
+    backtracks = 0
 
     while f_next > f_next_upper + tol && gamma >= minimum_gamma
         gamma *= reduce_gamma
+        backtracks += 1
+
         @. q = U - gamma * grad_U
-        grad_g = learned_grad(model, system, q, x0)
-        @. U_next = q - grad_g
-        refine_residual = 0.0
-        if refine
-            refine_input = copy(U_next)
-            projected_U, project_time = project(x0, refine_input)
-            copyto!(U_next, projected_U)
-            projection_solve_time += project_time
-            refine_residual = norm(refine_input - U_next, Inf)
-        end
+        @. U_next = clamp(q, system.umin, system.umax)
         @. res = U - U_next
 
-        f_next, _ = evaluate_cost_gradient(system, x0, U_next)
+        f_next, _ = learned_objective_gradient(model, system, x0, U_next)
         f_next_upper = f_model(f_U, grad_U, res, gamma)
         tol = 10 * eps(R) * (1 + abs(f_next))
     end
@@ -77,78 +75,43 @@ function backtrack_stepsize!(
         @warn "stepsize `gamma` became too small ($(gamma))"
     end
 
-    return gamma, f_next, refine_residual, projection_solve_time
-end
-
-
-function projection(system::LinearMPC)
-    model = Model(Gurobi.Optimizer)
-    set_silent(model)
-
-    nx, nu, N = system.nx, system.nu, system.N
-    @variable(model, system.xmin <= x[1:nx, 1:N+1] <= system.xmax)
-    @variable(model, system.umin <= u[1:nu, 1:N] <= system.umax)
-    @variable(model, x0[i in 1:nx] in MOI.Parameter(system.x0[i]))
-    @variable(model, q_ref[i in 1:nu, k in 1:N] in MOI.Parameter(0.0))
-
-    @constraint(model, x[:, 1] .== x0)
-    for k in 1:N
-        @constraint(model, x[:, k+1] .== system.A * x[:, k] + system.B * u[:, k])
-    end
-    @objective(model, Min, 0.5 * sum((u[i, k] - q_ref[i, k])^2 for i in 1:nu, k in 1:N))
-
-    return function solver(init::Vector{Float64}, q::Matrix{Float64}; verbose = false)
-        set_parameter_value.(x0, init)
-        set_parameter_value.(q_ref, q)
-        optimize!(model)
-
-        if verbose
-            println(solution_summary(model))
-        end
-
-        return value.(u), solve_time(model)
-    end
+    return gamma, f_next, backtracks
 end
 
 
 function learned_PGM(
-    model::LearnedPCF,
+    model::ProjectionMLP,
     system::LinearMPC;
     gamma::Float64 = model.rho,
     minimum_gamma::Float64 = 1e-6,
     reduce_gamma::Float64 = 0.5,
     increase_gamma::Float64 = 1.05,
     max_iter::Int = 100,
-    refine::Bool = false,
     tol::Float64 = 1e-6,
 )
     U = zeros(Float64, system.nu, system.N)
     q = similar(U)
     U_next = similar(U)
     res = similar(U)
-    project = projection(system)
 
     return @inbounds function solver(x0::Vector{Float64}; verbose = false)
         fill!(U, 0.0)
         current_gamma = gamma
-        
+
         objective_history = Float64[]
         residual_history = Float64[]
         gamma_history = Float64[]
-        refine_residual_history = Float64[]
-        projection_solve_time = 0.0
+        backtrack_history = Int[]
 
         start_time = time()
         for iter in 1:max_iter
-            cost, grad = evaluate_cost_gradient(system, x0, U)
+            cost, grad = learned_objective_gradient(model, system, x0, U)
             current_gamma *= increase_gamma
 
-            current_gamma, trial_cost, refine_residual, project_time = backtrack_stepsize!(
+            current_gamma, trial_cost, backtracks = backtrack_stepsize!(
                 current_gamma,
                 model,
                 system,
-                project,
-                refine,
                 x0,
                 U,
                 cost,
@@ -159,30 +122,29 @@ function learned_PGM(
                 minimum_gamma = minimum_gamma,
                 reduce_gamma = reduce_gamma,
             )
-            projection_solve_time += project_time
-
-            push!(gamma_history, current_gamma)
-            if refine
-                push!(refine_residual_history, refine_residual)
-            end
 
             push!(objective_history, trial_cost)
+            push!(gamma_history, current_gamma)
+            push!(backtrack_history, backtracks)
 
             @. res = U - U_next
             residual = norm(res, Inf)
             push!(residual_history, residual)
             copyto!(U, U_next)
 
+            if verbose
+                println("Learned PGM iteration $iter: residual = $residual, gamma = $current_gamma")
+            end
+
             if residual <= tol
                 if verbose
-                    println("Learned adaptive PGM converged at iteration $iter")
+                    println("Learned PGM converged at iteration $iter")
                 end
                 break
             end
         end
 
         wall_time = time() - start_time
-        solve_time = wall_time + projection_solve_time
 
         return (
             U = copy(U),
@@ -190,11 +152,10 @@ function learned_PGM(
             objective_history = objective_history,
             residual_history = residual_history,
             gamma_history = gamma_history,
+            backtrack_history = backtrack_history,
             gamma = current_gamma,
-            refine_residual_history = refine_residual_history,
-            projection_solve_time = projection_solve_time,
             wall_time = wall_time,
-            solve_time = solve_time,
+            solve_time = wall_time,
         )
     end
 end

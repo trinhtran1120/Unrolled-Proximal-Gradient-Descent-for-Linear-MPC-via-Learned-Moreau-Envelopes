@@ -6,13 +6,51 @@ where
 """
 
 using LinearAlgebra
+using OSQP
+using JuMP
+import MathOptInterface as MOI
 using ProximalAlgorithms
-using ProximalCore
 using ProximalOperators
 
 include("problem.jl")
+include("../utils/preprocess.jl")
 
 
+function StateConstraint(name, problem, tol::Float64 = 1e-8)
+    solver_name = name isa Symbol ? String(name) : name
+    solver_tol = max(tol, eps(Float64))
+    model = pick_solver(solver_name, solver_tol)
+    A_ro = problem.A_ro
+    B_ro = problem.B_ro
+    xmin = problem.xmin
+    xmax = problem.xmax
+    nx = problem.nx
+    nu = problem.nu
+    N = problem.N
+
+    @variable(model, x0[i in 1:nx] in MOI.Parameter(problem.x0[i]))
+    @variable(model, V[1:nu * N])
+    @variable(model, U_ref[i in 1:nu * N] in MOI.Parameter(0.0))
+
+    X = A_ro * x0 + B_ro * V
+    @constraint(model, X .<= fill(xmax, nx * N))
+    @constraint(model, fill(xmin, nx * N) .<= X)
+    @objective(model, Min, 0.5 * sum((V[i] - U_ref[i])^2 for i in 1:nu * N))
+
+    function solver(init::Vector{Float64}, q::AbstractVector{Float64}; verbose = false)
+        set_parameter_value.(x0, init)
+        set_parameter_value.(U_ref, q)
+        optimize!(model)
+
+        if verbose
+            println(solution_summary(model))
+        end
+
+        return value.(V), objective_value(model)
+    end
+
+    return solver
+end
 
 struct DifferentiableQuadratic
     H::Matrix{Float64}
@@ -26,6 +64,38 @@ end
 function ProximalAlgorithms.value_and_gradient(f::DifferentiableQuadratic, u)
     grad = f.H * u + f.h
     return f(u), grad
+end
+
+
+struct MoreauSmoothedCost
+    cost::DifferentiableQuadratic
+    project::Function
+    x0::Vector{Float64}
+    rho::Float64
+    data
+end
+
+function (f::MoreauSmoothedCost)(u)
+    value, _ = ProximalAlgorithms.value_and_gradient(f, u)
+    return value
+end
+
+function ProximalAlgorithms.value_and_gradient(f::MoreauSmoothedCost, u)
+    cost_value, cost_grad = ProximalAlgorithms.value_and_gradient(f.cost, u)
+    projected_u, distance_value = f.project(f.x0, u)
+    distance_grad = u .- projected_u
+    value = cost_value + distance_value / f.rho
+    grad = cost_grad .+ distance_grad ./ f.rho
+
+    if f.data !== nothing
+        push!(f.data["input"], copy(u))
+        push!(f.data["parameter"], copy(f.x0))
+        push!(f.data["proj"], copy(projected_u))
+        push!(f.data["env"], distance_value)
+        push!(f.data["grad"], copy(distance_grad))
+    end
+
+    return value, grad
 end
 
 
@@ -86,40 +156,18 @@ function evaluate_cost_gradient(problem::LinearMPC, x0::Vector{Float64}, U::Matr
     return variable_cost + constant_cost, reshape(grad, problem.nu, problem.N)
 end
 
-    
 
-function constraint(problem::LinearMPC, x0::Vector{Float64}; solver=:osqp)
-    """Compute the constraints for the linear MPC problem"""
-    A_ro = problem.A_ro
-    B_ro = problem.B_ro
-    xmin = problem.xmin
-    xmax = problem.xmax
-    umin = problem.umin
-    umax = problem.umax
-    nx = problem.nx
-    nu = problem.nu
-    N = problem.N
-
-    x_lower = fill(xmin, nx * N) .- A_ro * x0
-    x_upper = fill(xmax, nx * N) .- A_ro * x0
-
-    u_lower = fill(umin, nu * N)
-    u_upper = fill(umax, nu * N)
-
-    return ProximalOperators.IndPolyhedral(
-        x_lower,
-        B_ro,
-        x_upper,
-        u_lower,
-        u_upper;
-        solver = solver,
-    )
+function constraint(problem::LinearMPC; solver = "OSQP", tol::Float64 = 1e-8)
+    """Return a projection solver for the state-feasible set C(x0)."""
+    return StateConstraint(solver, problem, tol)
 end
 
 
 function PGM_solver(
     problem::LinearMPC;
+    rho::Float64=0.1, #Moreau smoothing parameter
     gamma::Float64=0.01, #stepsize
+    projection_tol::Float64=1e-8,
     adaptive::Bool=true, #use adaptive stepsize (backtracking)
     minimum_gamma::Float64=1e-6,
     reduce_gamma::Float64=0.5,
@@ -131,17 +179,21 @@ function PGM_solver(
 
     nu = problem.nu
     N = problem.N
-
     u0 = zeros(Float64, nu * N)
     u_solution = copy(u0)
+    input_constraint = ProximalOperators.IndBox(
+        fill(problem.umin, nu * N),
+        fill(problem.umax, nu * N),
+    )
+    project = constraint(problem; solver = "OSQP", tol = projection_tol)
 
     return @inbounds function solver(x0::Vector{Float64}; data = nothing, verbose = false)
-        f = single_shooting_cost(problem, x0)
-        g = constraint(problem, x0; solver = :osqp)
+        cost = single_shooting_cost(problem, x0)
+        f = MoreauSmoothedCost(cost, project, x0, rho, data)
 
         ffb_iter = ProximalAlgorithms.FastForwardBackwardIteration(
             f = f,
-            g = g,
+            g = input_constraint,
             x0 = u0,
             gamma = adaptive ? nothing : gamma,
             adaptive = adaptive,
@@ -150,40 +202,31 @@ function PGM_solver(
             increase_gamma = increase_gamma,
         )
 
-            for (iter, state) in enumerate(ffb_iter)
-                u_solution .= state.z
-
-                # Store psi(q; x0) = 0.5 * dist_F(x0)(q)^2. For an indicator, state.z = prox(g, state.y, gamma) = P_F(state.y), independent of gamma.
-                d = state.y .- state.z                          # = y − P_F(y) (P_F: projection onto F)
-                distance_grad = d
-                distance_value = 0.5 * dot(d, d)                # = 0.5 * ||y - P_F(y)||^2
-
-                if data !== nothing 
-                        push!(data["input"], copy(state.y))
-                        push!(data["parameter"], copy(x0))
-                        push!(data["proj"], copy(state.z))
-                        push!(data["env"], distance_value)
-                        push!(data["grad"], copy(distance_grad))
-                end
-
-                residual = norm(state.res, Inf) / state.gamma
-
-                if residual <= tol
-                    if verbose
-                        println("Converged at iteration $iter")
-                    end
-                    break
-                end
-
-                if iter >= max_iter
-                    break
-                end
+        for (iter, state) in enumerate(ffb_iter)
+            u_solution .= state.z
+            residual = norm(state.res, Inf) / state.gamma
+            
+            if data !== nothing
+                haskey(data, "gamma") && push!(data["gamma"], state.gamma)
             end
 
-            U = reshape(u_solution, nu, N)
-            X = rollout(problem, x0, U)
-            objective = f(u_solution)
+            if residual <= tol
+                if verbose
+                    println("Converged at iteration $iter")
+                end
+                break
+            end
 
-            return U, X, objective
+            if iter >= max_iter
+                break
+            end
         end
+
+        U = reshape(u_solution, nu, N)
+        X = rollout(problem, x0, U)
+        final_f = MoreauSmoothedCost(cost, project, x0, rho, nothing)
+        objective = final_f(u_solution)
+
+        return U, X, objective
+    end
 end

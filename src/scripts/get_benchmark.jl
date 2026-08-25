@@ -1,47 +1,39 @@
 # Benchmark open-loop linear MPC methods.
-using Pkg
-Pkg.activate(joinpath(@__DIR__, "..", ".."))
-Pkg.instantiate()
-
 using LinearAlgebra
 using Printf
 using Statistics
 
-using OSQP, Gurobi
+using OSQP
 
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
-solver_name = "gurobi"
+solver_name = "OSQP"
 tol = 1e-3
 pgm_max_iter = 1000
 learned_pgm_max_iter = 1000
 benchmark_samples = 10
+exact_pgm_rho = 0.1
 exact_pgm_gamma = 0.1
 exact_pgm_adaptive = true
+learned_pgm_rho = 0.1
 learned_pgm_gamma = 0.01
 learned_pgm_minimum_gamma = 1e-6
 learned_pgm_reduce_gamma = 0.5
 learned_pgm_increase_gamma = 1.05
-learned_pgm_refine = true
-model_path = joinpath(@__DIR__,"..", "..", "model", "linear-mpc-pcf_adaptive.json")
+model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-pcf_adaptive.json")
 
 mpc_data = mpc_problem()
 x0 = mpc_data.x0
+learned_model = load_projection_mlp(model_path)
 
 solve_mpc = mpc_solver(solver_name, mpc_data, tol)
-solve_pgm = PGM_solver(mpc_data; gamma = exact_pgm_gamma, adaptive = exact_pgm_adaptive, max_iter = pgm_max_iter, tol = tol)
-
-learned_model = load_pcf(model_path)
-solve_learned = learned_PGM(
-    learned_model,
+solve_pgm = PGM_solver(
     mpc_data;
-    gamma = learned_pgm_gamma,
-    minimum_gamma = learned_pgm_minimum_gamma,
-    reduce_gamma = learned_pgm_reduce_gamma,
-    increase_gamma = learned_pgm_increase_gamma,
-    max_iter = learned_pgm_max_iter,
-    refine = learned_pgm_refine,
+    rho = exact_pgm_rho,
+    gamma = exact_pgm_gamma,
+    adaptive = exact_pgm_adaptive,
+    max_iter = pgm_max_iter,
     tol = tol,
 )
 
@@ -67,18 +59,19 @@ println("================ Open-loop linear MPC benchmark ================")
 println("initial state = $x0")
 println("horizon N = $(mpc_data.N)")
 println("solver = $solver_name")
+println("exact PGM rho = $exact_pgm_rho")
 println("exact PGM gamma = $exact_pgm_gamma")
 println("exact PGM mode = $(exact_pgm_adaptive ? "adaptive" : "fixed")")
-println("learned adaptive PCF-PGM initial gamma = $learned_pgm_gamma")
-println("learned adaptive PCF-PGM minimum gamma = $learned_pgm_minimum_gamma")
-println("learned adaptive PCF-PGM reduce gamma = $learned_pgm_reduce_gamma")
-println("learned adaptive PCF-PGM increase gamma = $learned_pgm_increase_gamma")
-println("learned PCF-PGM depth = $learned_pgm_max_iter")
-println("projection refine = $learned_pgm_refine")
+println("learned projection PGM rho = $learned_pgm_rho")
+println("learned projection PGM initial gamma = $learned_pgm_gamma")
+println("learned projection PGM minimum gamma = $learned_pgm_minimum_gamma")
+println("learned projection PGM reduce gamma = $learned_pgm_reduce_gamma")
+println("learned projection PGM increase gamma = $learned_pgm_increase_gamma")
+println("learned projection PGM max_iter = $learned_pgm_max_iter")
 println("learned model = $model_path")
 println("learned model input_dim = $(learned_model.input_dim)")
 println("learned model parameter_dim = $(learned_model.parameter_dim)")
-println("learned model represents psi(q; x0) = 0.5 * dist(q, F(x0))^2")
+println("learned model target = state projection")
 println()
 
 println("---------------- $solver_name ----------------")
@@ -96,7 +89,17 @@ J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
 @printf("max |solver U - PGM U| = %8.4e\n", maximum(abs.(opt_U - pgm_U)))
 @printf("max |solver X - PGM X| = %8.4e\n\n", maximum(abs.(opt_X - pgm_X)))
 
-println("---------------- learned adaptive PCF-PGM ----------------")
+println("---------------- learned projection PGM ----------------")
+solve_learned = learned_PGM(
+    learned_model,
+    mpc_data;
+    gamma = learned_pgm_gamma,
+    minimum_gamma = learned_pgm_minimum_gamma,
+    reduce_gamma = learned_pgm_reduce_gamma,
+    increase_gamma = learned_pgm_increase_gamma,
+    max_iter = learned_pgm_max_iter,
+    tol = tol,
+)
 learned_sol = solve_learned(x0; verbose = true)
 J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 @printf("objective = %10.6f\n", J_learned)

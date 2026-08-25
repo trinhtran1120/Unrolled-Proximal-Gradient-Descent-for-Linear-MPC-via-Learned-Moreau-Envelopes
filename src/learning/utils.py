@@ -10,6 +10,9 @@ from dataclasses import asdict, dataclass, is_dataclass
 from typing import Any, Sequence
 
 import jax
+
+jax.config.update("jax_enable_x64", True)
+
 import jax.numpy as jnp
 import numpy as np
 
@@ -44,7 +47,7 @@ class Section:
 def _rand_uniform(key: jax.Array, shape: tuple[int, ...]) -> jnp.ndarray:
     """Initialize dense parameters with fan-in scaling."""
     fan_in = shape[-1] if len(shape) > 1 else 1
-    return jax.random.uniform(key, shape, minval=-0.5, maxval=0.5) / np.sqrt(fan_in)
+    return jax.random.uniform(key, shape, minval=-0.5, maxval=0.5, dtype=jnp.float64) / np.sqrt(fan_in)
 
 
 def _make_sections(input_dim: int, widths: Sequence[int]) -> tuple[tuple[int, ...], Params, int]:

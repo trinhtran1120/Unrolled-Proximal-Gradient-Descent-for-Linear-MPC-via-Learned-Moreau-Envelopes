@@ -1,13 +1,9 @@
 # Generate training and testing datasets for the linear MPC example
-using Pkg
-Pkg.activate(joinpath(@__DIR__, "..", ".."))
-Pkg.instantiate()
-
 using JuMP
 import MathOptInterface as MOI
 using LinearAlgebra
 using NPZ
-using OSQP, Gurobi, Ipopt, MosekTools
+using OSQP, Ipopt, MosekTools
 using Printf
 
 include(joinpath(@__DIR__, "..", "mpc", "problem.jl"))
@@ -21,11 +17,13 @@ const DATASET_DIR = joinpath(@__DIR__, "..", "..", "data")
 mkpath(DATASET_DIR)
 
 #solver settings
-solver_name = "Gurobi"
+solver_name = "Ipopt"
+feasibility_solver_name = "OSQP"
 const solver_tol = 1e-6
 
 #PGM algorithm settings
 const pgm_tol = 1e-2
+const pgm_rho = 0.1
 const pgm_gamma = 0.001
 const pgm_adaptive = true
 const pgm_max_iter = 1000
@@ -35,18 +33,30 @@ const near_zero_env_tol = 1e-12
 const near_zero_grad_tol = 1e-10
 const zero_to_nonzero_ratio = 0.1
 
+function stack_samples(data, key)
+    isempty(data[key]) && error("No samples collected for `$key`; check the feasible initial-state pool and PGM settings.")
+    return reduce(hcat, data[key])
+end
+
 function main()
     mode_tag = pgm_adaptive ? "adaptive" : "fixed"
 
     mpc_data = mpc_problem()
     solve_mpc = mpc_solver(solver_name, mpc_data, solver_tol)
-    solve_pgm = PGM_solver(mpc_data; gamma = pgm_gamma, adaptive = pgm_adaptive, max_iter = pgm_max_iter, tol = pgm_tol)
+    solve_pgm = PGM_solver(
+        mpc_data;
+        rho = pgm_rho,
+        gamma = pgm_gamma,
+        adaptive = pgm_adaptive,
+        max_iter = pgm_max_iter,
+        tol = pgm_tol,
+    )
     cost_func = mpc_data.cost_func
 
     data_train = Dict("input" => Vector{Float64}[], "parameter" => Vector{Float64}[], "proj" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
     data_test = Dict("input" => Vector{Float64}[], "parameter" => Vector{Float64}[], "proj" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
 
-    is_feasible = initialization(solver_name, mpc_data, solver_tol)
+    is_feasible = initialization(feasibility_solver_name, mpc_data, solver_tol)
 
     x1_grid = -2.0:0.5:3.0
     x2_grid = -2.0:0.5:4.0
@@ -57,8 +67,12 @@ function main()
         if !isapprox([x1, x2], [0.0, 0.0]; atol = 1e-12) && is_feasible([Float64(x1), Float64(x2)])
     ]
     split_idx = round(Int, 0.8 * length(initial_pool))
+    isempty(initial_pool) && error("No feasible initial states found; try a different feasibility solver or a wider grid.")
+
     train_pool = initial_pool[1:split_idx]
     test_pool = initial_pool[split_idx+1:end]
+    isempty(train_pool) && error("Training pool is empty; increase the initial-state grid size.")
+    isempty(test_pool) && error("Testing pool is empty; increase the initial-state grid size.")
 
     for x0 in train_pool
         println("================ Collecting training data with initial state = $x0 ================")
@@ -94,19 +108,20 @@ function main()
         filter_train.retained,
     )
     train_data = Dict{String,Any}(
-        "input" => reduce(hcat, data_train["input"]),
-        "parameter" => reduce(hcat, data_train["parameter"]),
-        "proj" => reduce(hcat, data_train["proj"]),
-        "grad" => reduce(hcat, data_train["grad"]),
+        "input" => stack_samples(data_train, "input"),
+        "parameter" => stack_samples(data_train, "parameter"),
+        "proj" => stack_samples(data_train, "proj"),
+        "grad" => stack_samples(data_train, "grad"),
         "adaptive" => pgm_adaptive,
         "env" => data_train["env"],
         "N" => mpc_data.N,
         "nx" => mpc_data.nx,
         "nu" => mpc_data.nu,
+        "rho_initial" => pgm_rho,
+        "gamma_initial" => pgm_gamma,
     )
-    pgm_adaptive || (train_data["rho_initial"] = pgm_gamma)
     npzwrite(
-        joinpath(DATASET_DIR, "PGM_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
+        joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
         train_data,
     )
 
@@ -119,19 +134,20 @@ function main()
 
     @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
     test_data = Dict{String,Any}(
-        "input" => reduce(hcat, data_test["input"]),
-        "parameter" => reduce(hcat, data_test["parameter"]),
-        "proj" => reduce(hcat, data_test["proj"]),
-        "grad" => reduce(hcat, data_test["grad"]),
+        "input" => stack_samples(data_test, "input"),
+        "parameter" => stack_samples(data_test, "parameter"),
+        "proj" => stack_samples(data_test, "proj"),
+        "grad" => stack_samples(data_test, "grad"),
         "adaptive" => pgm_adaptive,
         "env" => data_test["env"],
         "N" => mpc_data.N,
         "nx" => mpc_data.nx,
         "nu" => mpc_data.nu,
+        "rho_initial" => pgm_rho,
+        "gamma_initial" => pgm_gamma,
     )
-    pgm_adaptive || (test_data["rho_initial"] = pgm_gamma)
     npzwrite(
-        joinpath(DATASET_DIR, "PGM_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
+        joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
         test_data,
     )
 end

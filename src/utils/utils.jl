@@ -24,6 +24,22 @@ struct LearnedPCF
     rho::Float64
 end
 
+struct ProjectionMLP
+    input_dim::Int
+    parameter_dim::Int
+    output_dim::Int
+    weights::Vector{Matrix{Float64}}
+    biases::Vector{Vector{Float64}}
+    input_mean::Vector{Float64}
+    input_std::Vector{Float64}
+    parameter_mean::Vector{Float64}
+    parameter_std::Vector{Float64}
+    Gx::Matrix{Float64}
+    b_offset::Vector{Float64}
+    b_theta::Matrix{Float64}
+    rho::Float64
+end
+
 softplus(x) = log1p(exp(-abs(x))) + max(x, zero(x))
 
 function json_matrix(x)
@@ -74,6 +90,32 @@ function load_pcf(path::AbstractString)
         json_vector(normalization.parameter_mean),
         json_vector(normalization.parameter_std),
         Float64(normalization.env_scale),
+        rho,
+    )
+end
+
+function load_projection_mlp(path::AbstractString)
+    data = JSON3.read(read(path, String))
+    data.model_type == "projection_mlp" || throw(ArgumentError("expected model_type = projection_mlp"))
+    data.target == "state_projection" || throw(ArgumentError("expected target = state_projection"))
+
+    normalization = data.normalization
+    feasibility = data.feasibility
+    rho = haskey(data, :rho_initial) && !isnothing(data.rho_initial) ? Float64(data.rho_initial) : Float64(data.gamma_initial)
+
+    return ProjectionMLP(
+        Int(data.input_dim),
+        Int(data.parameter_dim),
+        Int(data.output_dim),
+        [json_matrix(W) for W in data.weights],
+        [json_vector(b) for b in data.biases],
+        json_vector(normalization.input_mean),
+        json_vector(normalization.input_std),
+        json_vector(normalization.parameter_mean),
+        json_vector(normalization.parameter_std),
+        json_matrix(feasibility.g_matrix),
+        json_vector(feasibility.b_offset),
+        json_matrix(feasibility.b_theta),
         rho,
     )
 end
@@ -133,6 +175,44 @@ function pcf_grad(model::LearnedPCF, input::AbstractVector, parameter::AbstractV
     parameter_norm = (parameter .- model.parameter_mean) ./ model.parameter_std
     grad_norm = ForwardDiff.gradient(q -> pcf_value_norm(model, q, parameter_norm), input_norm)
     return grad_norm .* model.env_scale ./ model.input_std
+end
+
+function projection_mlp_raw(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+    length(input) == model.input_dim || throw(DimensionMismatch("input has length $(length(input)); expected $(model.input_dim)"))
+    length(parameter) == model.parameter_dim ||
+        throw(DimensionMismatch("parameter has length $(length(parameter)); expected $(model.parameter_dim)"))
+
+    input_norm = (input .- model.input_mean) ./ model.input_std
+    parameter_norm = (parameter .- model.parameter_mean) ./ model.parameter_std
+    z = vcat(input_norm, parameter_norm)
+
+    for layer in 1:length(model.weights)-1
+        z = tanh.(model.weights[layer] * z .+ model.biases[layer])
+    end
+
+    return vec(model.weights[end] * z .+ model.biases[end])
+end
+
+function projection_mlp_corrected(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+    raw = projection_mlp_raw(model, input, parameter)
+    slack_dim = size(model.Gx, 1)
+    expected_output_dim = model.input_dim + slack_dim
+    length(raw) == expected_output_dim ||
+        throw(DimensionMismatch("model output has length $(length(raw)); expected $(expected_output_dim)"))
+
+    V_hat = raw[1:model.input_dim]
+    s_hat = raw[model.input_dim + 1:end]
+    b = model.b_offset .+ model.b_theta * parameter
+    residual = model.Gx * V_hat .+ s_hat .- b
+    correction = (model.Gx * model.Gx' + I(slack_dim)) \ residual
+    V_tilde = V_hat .- model.Gx' * correction
+    s_tilde = s_hat .- correction
+    return V_tilde, s_tilde
+end
+
+function projection_mlp_gradient(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+    V_tilde, _ = projection_mlp_corrected(model, input, parameter)
+    return (input .- V_tilde) ./ model.rho
 end
 
 function filter_zero!(data; env_tol, grad_tol, zero_to_nonzero_ratio, seed = 1234)
