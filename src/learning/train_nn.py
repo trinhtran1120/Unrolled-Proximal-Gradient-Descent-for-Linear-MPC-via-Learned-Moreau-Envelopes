@@ -24,6 +24,7 @@ model_path = model_dir / "linear-mpc-projection-mlp"
 
 
 hidden_widths = (64, 64)
+activation = "gelu"
 learning_rate = 1e-3
 lr_decay_rate = 0.98
 lr_decay_steps = 10000
@@ -106,6 +107,7 @@ def main():
 
     print(f"samples: train={input_tr.shape[0]} test={input_te.shape[0]}")
     print(f"dims: input={train_meta['input_dim']} parameter={train_meta['parameter_dim']}")
+    print(f"activation: {activation}")
     print(f"weights: projection=1.0 equality={eq_weight} slack_positive={slack_positive_weight}")
 
     params = nn.train(
@@ -117,6 +119,7 @@ def main():
         feas,
         w=weight_tr,
         widths=hidden_widths,
+        activation=activation,
         lr=learning_rate,
         lr_decay_rate=lr_decay_rate,
         lr_decay_steps=lr_decay_steps,

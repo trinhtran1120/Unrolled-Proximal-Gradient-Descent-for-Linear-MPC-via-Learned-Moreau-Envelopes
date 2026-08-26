@@ -15,10 +15,24 @@ struct ProjectionMLP
     b_theta::Matrix{Float64}
     E::Matrix{Float64}
     E_pinv::Matrix{Float64}
+    activation::String
     rho::Float64
 end
 
 gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
+selu(x) = 1.0507009873554805 * (x > 0 ? x : 1.6732632423543772 * (exp(x) - 1))
+
+function activate(x, activation::String)
+    if activation == "gelu"
+        return gelu(x)
+    elseif activation == "selu"
+        return selu(x)
+    elseif activation == "tanh"
+        return tanh(x)
+    else
+        throw(ArgumentError("unsupported activation: $activation"))
+    end
+end
 
 function json_matrix(x)
     return Matrix{Float64}(reduce(hcat, Float64.(row) for row in x)')
@@ -42,6 +56,7 @@ function load_projection_mlp(path::AbstractString)
     E = hasproperty(feasibility, :E) ? json_matrix(feasibility.E) : hcat(Gx, Matrix{Float64}(I, size(Gx, 1), size(Gx, 1)))
     E_pinv = hasproperty(feasibility, :E_pinv) ? json_matrix(feasibility.E_pinv) : ((E * E') \ E)'
     rho = Float64(json_field(data, :rho_initial, json_field(data, :rho, json_field(data, :gamma, 1.0))))
+    activation = String(json_field(data, :activation, "gelu"))
 
     return ProjectionMLP(
         Int(data.input_dim),
@@ -55,6 +70,7 @@ function load_projection_mlp(path::AbstractString)
         b_theta,
         E,
         E_pinv,
+        activation,
         rho,
     )
 end
@@ -67,7 +83,7 @@ function projection_mlp_forward(model::ProjectionMLP, input::AbstractVector, par
 
     z = vcat(input, parameter)
     for layer in 1:length(model.weights)-1
-        z = gelu.(model.weights[layer] * z .+ model.biases[layer])
+        z = activate.(model.weights[layer] * z .+ model.biases[layer], Ref(model.activation))
     end
     z_bar = model.weights[end] * z .+ model.biases[end]
     b = model.b_offset .+ model.b_theta * parameter[1:size(model.b_theta, 2)]

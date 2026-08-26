@@ -11,7 +11,7 @@ from flax.core import unfreeze
 
 jax.config.update("jax_enable_x64", True)
 
-from utils import Params, _batches, _copy_params, _dense_layer_names, to_jsonable
+from utils import Params, _batches, _copy_params, to_jsonable
 
 hidden_widths = (64, 64)
 dtype = jnp.float64
@@ -53,6 +53,7 @@ def projection_layer(
 class NeuralProjection(nn.Module):
     hidden_layers: tuple[int, ...]
     output_dim: int
+    activation: str = "gelu"
 
     def setup(self) -> None:
         self.kernel_init = nn.initializers.xavier_uniform()
@@ -63,12 +64,22 @@ class NeuralProjection(nn.Module):
         z = jnp.concatenate((model_input, parameter), axis=-1)
         for width in self.hidden_layers:
             z = nn.Dense(width, dtype=dtype, param_dtype=dtype, kernel_init=self.kernel_init, bias_init=self.bias_init)(z)
-            z = nn.gelu(z, approximate=False)
+            z = apply_activation(z, self.activation)
 
         output = nn.Dense(self.output_dim, dtype=dtype, param_dtype=dtype, kernel_init=self.kernel_init, bias_init=self.bias_init)(z)
         v_bar = output[..., : model_input.shape[-1]]
         s_bar = output[..., model_input.shape[-1] :]
         return v_bar, s_bar
+
+
+def apply_activation(x: jnp.ndarray, activation: str) -> jnp.ndarray:
+    if activation == "gelu":
+        return nn.gelu(x, approximate=False)
+    if activation == "selu":
+        return nn.selu(x)
+    if activation == "tanh":
+        return nn.tanh(x)
+    raise ValueError(f"unsupported activation: {activation}")
 
 
 # ============================================================================
@@ -92,7 +103,11 @@ def loss(
     eq_weight: float = 1.0,
     slack_positive_weight: float = 1.0,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]]:
-    model = NeuralProjection(hidden_layers=tuple(params["hidden_layers"]), output_dim=params["output_dim"])
+    model = NeuralProjection(
+        hidden_layers=tuple(params["hidden_layers"]),
+        output_dim=params["output_dim"],
+        activation=params.get("activation", "gelu"),
+    )
     v_bar, s_bar = model.apply({"params": params["flax_params"]}, model_input, parameter)
     v_hat, s_hat = projection_layer(
         jnp.concatenate((v_bar, s_bar), axis=-1),
@@ -113,30 +128,6 @@ def loss(
     return objective, (projection_mse, equality_mse, slack_mse)
 
 
-def _gelu_grad(x: jnp.ndarray) -> jnp.ndarray:
-    cdf = 0.5 * (1.0 + jax.lax.erf(x / jnp.sqrt(2.0)))
-    pdf = jnp.exp(-0.5 * x**2) / jnp.sqrt(2.0 * jnp.pi)
-    return cdf + x * pdf
-
-
-def _manual_forward(flax_params: Params, model_input: jnp.ndarray, parameter: jnp.ndarray):
-    x = jnp.concatenate((model_input, parameter), axis=-1)
-    activations = [x]
-    preactivations = []
-
-    layer_names = _dense_layer_names(flax_params)
-    for name in layer_names[:-1]:
-        layer = flax_params[name]
-        x = activations[-1] @ layer["kernel"] + layer["bias"]
-        preactivations.append(x)
-        activations.append(nn.gelu(x, approximate=False))
-
-    layer = flax_params[layer_names[-1]]
-    z_hat = activations[-1] @ layer["kernel"] + layer["bias"]
-    activations.append(z_hat)
-    return z_hat, activations, preactivations, layer_names
-
-
 def loss_and_grad(
     params: Params,
     model_input: jnp.ndarray,
@@ -147,45 +138,21 @@ def loss_and_grad(
     eq_weight: float = 1.0,
     slack_positive_weight: float = 1.0,
 ) -> tuple[jnp.ndarray, tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray], Params]:
-    z_bar, activations, preactivations, layer_names = _manual_forward(params["flax_params"], model_input, parameter)
-    E = jnp.asarray(feasibility_data["E"], dtype=model_input.dtype)
-    E_pinv = jnp.asarray(feasibility_data["E_pinv"], dtype=model_input.dtype)
-    v_hat, s_hat = projection_layer(
-        z_bar,
-        parameter,
-        E,
-        jnp.asarray(feasibility_data["b_offset"], dtype=model_input.dtype),
-        jnp.asarray(feasibility_data["b_para"], dtype=parameter.dtype),
-        E_pinv,
-    )
+    def objective_for_flax_params(flax_params):
+        objective, parts = loss(
+            {**params, "flax_params": flax_params},
+            model_input,
+            parameter,
+            projection,
+            weights,
+            feasibility_data,
+            eq_weight,
+            slack_positive_weight,
+        )
+        return objective, parts
 
-    Gx = jnp.asarray(feasibility_data["g_matrix"], dtype=model_input.dtype)
-    residual = _constraint_residual(v_hat, s_hat, parameter, feasibility_data)
-    sample_weights = weights / jnp.maximum(jnp.mean(weights), 1e-12)
-    scaled_weights = sample_weights[:, None] / model_input.shape[0]
-
-    projection_mse = jnp.mean(sample_weights * jnp.sum((v_hat - projection) ** 2, axis=1))
-    equality_mse = jnp.mean(sample_weights * jnp.sum(residual**2, axis=1))
-    slack_mse = jnp.mean(sample_weights * jnp.sum(jax.nn.relu(-s_hat) ** 2, axis=1))
-    objective = projection_mse + eq_weight * equality_mse + slack_positive_weight * slack_mse
-
-    dz_v = 2.0 * scaled_weights * (v_hat - projection)
-    dz_v += 2.0 * eq_weight * scaled_weights * (residual @ Gx)
-    dz_s = 2.0 * eq_weight * scaled_weights * residual
-    dz_s += 2.0 * slack_positive_weight * scaled_weights * jnp.where(s_hat < 0.0, s_hat, 0.0)
-    dz = jnp.concatenate((dz_v, dz_s), axis=1) @ (jnp.eye(params["output_dim"], dtype=model_input.dtype) - E_pinv @ E)
-
-    grads = {}
-    for index in range(len(layer_names) - 1, -1, -1):
-        name = layer_names[index]
-        grads[name] = {
-            "kernel": activations[index].T @ dz,
-            "bias": jnp.sum(dz, axis=0),
-        }
-        if index > 0:
-            dz = (dz @ params["flax_params"][name]["kernel"].T) * _gelu_grad(preactivations[index - 1])
-
-    return objective, (projection_mse, equality_mse, slack_mse), grads
+    (objective, parts), grads = jax.value_and_grad(objective_for_flax_params, has_aux=True)(params["flax_params"])
+    return objective, parts, grads
 
 
 def corrected_projection(
@@ -194,7 +161,11 @@ def corrected_projection(
     parameter: jnp.ndarray,
     feasibility_data: Params,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
-    model = NeuralProjection(hidden_layers=tuple(params["hidden_layers"]), output_dim=params["output_dim"])
+    model = NeuralProjection(
+        hidden_layers=tuple(params["hidden_layers"]),
+        output_dim=params["output_dim"],
+        activation=params.get("activation", "gelu"),
+    )
     v_bar, s_bar = model.apply({"params": params["flax_params"]}, model_input, parameter)
     return projection_layer(
         jnp.concatenate((v_bar, s_bar), axis=-1),
@@ -250,6 +221,7 @@ def train(
     feasibility_data: Params,
     w: np.ndarray | None = None,
     widths: Sequence[int] = hidden_widths,
+    activation: str = "gelu",
     lr: float = 1e-3,
     lr_decay_rate: float = 1.0,
     lr_decay_steps: int = 1000,
@@ -280,7 +252,7 @@ def train(
     slack_dim = int(feasibility_data["g_matrix"].shape[0])
     output_dim = input_dim + slack_dim
     hidden_layers = tuple(int(width) for width in widths)
-    model = NeuralProjection(hidden_layers=hidden_layers, output_dim=output_dim)
+    model = NeuralProjection(hidden_layers=hidden_layers, output_dim=output_dim, activation=activation)
     variables = model.init(
         jax.random.PRNGKey(seed),
         jnp.zeros((1, input_dim), dtype=dtype),
@@ -292,6 +264,7 @@ def train(
         "slack_dim": slack_dim,
         "output_dim": output_dim,
         "hidden_layers": hidden_layers,
+        "activation": activation,
     }
     flax_params = unfreeze(variables["params"])
     best_flax_params = _copy_params(flax_params)

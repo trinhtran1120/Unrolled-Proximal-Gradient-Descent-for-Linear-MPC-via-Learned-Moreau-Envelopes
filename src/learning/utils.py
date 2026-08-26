@@ -69,7 +69,7 @@ def to_jsonable(params: Params) -> Any:
     exported["weights"] = weights
     exported["biases"] = biases
     exported["weight_orientation"] = "out_by_in"
-    exported["activation"] = "gelu"
+    exported["activation"] = params.get("activation", "gelu")
     exported["input_order"] = ["model_input", "parameter"]
     exported["output_order"] = ["V", "s"]
     return _to_serializable(exported)

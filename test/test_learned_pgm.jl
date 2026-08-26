@@ -25,6 +25,7 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
         b_theta,
         E,
         E_pinv,
+        "gelu",
         0.1,
     )
 
