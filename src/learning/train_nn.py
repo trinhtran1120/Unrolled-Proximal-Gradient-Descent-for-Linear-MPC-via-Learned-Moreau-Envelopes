@@ -20,17 +20,17 @@ model_dir = root / "model"
 
 train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train_adaptive.npz"
 test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test_adaptive.npz"
-model_path = model_dir / "linear-mpc-projection-mlp"
+model_path = model_dir / "linear-mpc-projection-mlp_tanh"
 
 
 hidden_widths = (64, 64)
-activation = "gelu"
+activation = "tanh"
 learning_rate = 1e-3
 lr_decay_rate = 0.98
 lr_decay_steps = 10000
-eq_weight = 1.0
+eq_weight = 0.1
 slack_positive_weight = 0.1
-l2_reg = 0.0
+l2_reg = 0.1
 batch_size = 128
 epochs = 5000
 eval_interval = 1000

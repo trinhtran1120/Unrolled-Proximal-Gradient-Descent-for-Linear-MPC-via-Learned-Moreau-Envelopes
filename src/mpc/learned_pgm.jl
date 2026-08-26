@@ -9,14 +9,14 @@ function mini_batch_grad!(
     grad::AbstractVector{Float64},
     input::AbstractVector{Float64},
     projection::AbstractVector{Float64},
-    rho::Float64;
+    gamma::Float64;
     batch_size::Int = length(input),
 )
     batch_size > 0 || throw(ArgumentError("batch_size must be positive"))
     ranges = [first:min(first + batch_size - 1, length(input)) for first in 1:min(batch_size, length(input)):length(input)]
     Threads.@threads for batch in eachindex(ranges)
         range = ranges[batch]
-        @inbounds @views grad[range] .= (input[range] .- projection[range]) ./ rho
+        @inbounds @views grad[range] .= (input[range] .- projection[range]) ./ gamma
     end
     return grad
 end
@@ -27,6 +27,7 @@ function learned_moreau(
     system::LinearMPC,
     U::Matrix{Float64},
     x0::Vector{Float64};
+    gamma::Float64 = 1.0,
     batch_size::Int = length(U),
 )
     size(U) == (system.nu, system.N) ||
@@ -37,9 +38,9 @@ function learned_moreau(
     input = vec(U)
     V_tilde, _ = projection_mlp_forward(model, input, x0)
     d = input .- V_tilde
-    value = dot(d, d) / (2 * model.rho)
+    value = dot(d, d) / (2 * gamma)
     grad = similar(input)
-    mini_batch_grad!(grad, input, V_tilde, model.rho; batch_size = batch_size)
+    mini_batch_grad!(grad, input, V_tilde, gamma; batch_size = batch_size)
     return value, reshape(grad, system.nu, system.N)
 end
 
@@ -49,25 +50,59 @@ function learned_objective_gradient(
     system::LinearMPC,
     x0::Vector{Float64},
     U::Matrix{Float64};
+    gamma::Float64 = 1.0,
     batch_size::Int = length(U),
 )
     cost, cost_grad = evaluate_cost_gradient(system, x0, U)
-    moreau_value, moreau_grad = learned_moreau(model, system, U, x0; batch_size = batch_size)
+    moreau_value, moreau_grad = learned_moreau(model, system, U, x0; gamma = gamma, batch_size = batch_size)
     return cost + moreau_value, cost_grad .+ moreau_grad
 end
 
 
 function learned_grad(model::ProjectionMLP, system::LinearMPC, q::Matrix{Float64}, x0::Vector{Float64})
-    grad = projection_mlp_gradient(model, vec(q), x0)
-    return reshape(grad, system.nu, system.N)
+    input = vec(q)
+    V_tilde, _ = projection_mlp_forward(model, input, x0)
+    return reshape(input .- V_tilde, system.nu, system.N)
 end
 
 
-learned_correction_scale(::ProjectionMLP, gamma::Float64) = gamma
+function learned_correction_scale(::ProjectionMLP, gamma::Float64, projection_relaxation)
+    return isnothing(projection_relaxation) ? gamma : projection_relaxation
+end
+
+
+function learned_cost_cache(system::LinearMPC, x0::Vector{Float64})
+    cost = single_shooting_cost(system, x0)
+    zero_U = zeros(Float64, system.nu, system.N)
+    zero_X = rollout(system, x0, zero_U)
+    constant_cost = sum(system.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:system.N)
+    return cost, constant_cost
+end
+
+
+function learned_cached_cost_gradient(
+    cost::DifferentiableQuadratic,
+    constant_cost::Float64,
+    system::LinearMPC,
+    U::Matrix{Float64},
+)
+    input = vec(U)
+    Hu = cost.H * input
+    grad = Hu .+ cost.h
+    value = 0.5 * dot(input, Hu) + dot(cost.h, input) + constant_cost
+    return value, reshape(grad, system.nu, system.N)
+end
 
 
 function f_model(f_x, grad_f_x, res, gamma)
     return f_x - real(dot(vec(grad_f_x), vec(res))) + norm(res)^2 / (2 * gamma)
+end
+
+
+function nesterov_step(theta::Float64)
+    theta_next = (1 + sqrt(1 + 4 * theta^2)) / 2
+    beta = (theta - 1) / theta_next
+    return theta_next, beta
 end
 
 
@@ -80,10 +115,11 @@ function learned_trial_step!(
     gamma::Float64,
     q::Matrix{Float64},
     U_next::Matrix{Float64},
+    projection_relaxation,
 )
     @. q = U - gamma * grad_U
     grad_g = learned_grad(model, system, q, x0)
-    scale = learned_correction_scale(model, gamma)
+    scale = learned_correction_scale(model, gamma, projection_relaxation)
     @. U_next = clamp(q - scale * grad_g, system.umin, system.umax)
     return U_next
 end
@@ -100,13 +136,15 @@ function backtrack_stepsize!(
     q::Matrix{Float64},
     U_next::Matrix{Float64},
     res::Matrix{Float64};
+    cost_gradient = (U_eval -> evaluate_cost_gradient(system, x0, U_eval)),
     minimum_gamma::R = R(1e-6),
     reduce_gamma::R = R(0.5),
+    projection_relaxation = nothing,
 ) where {R}
-    learned_trial_step!(model, system, x0, U, grad_U, gamma, q, U_next)
+    learned_trial_step!(model, system, x0, U, grad_U, gamma, q, U_next, projection_relaxation)
 
     @. res = U - U_next
-    f_next, _ = evaluate_cost_gradient(system, x0, U_next)
+    f_next, _ = cost_gradient(U_next)
     f_next_upper = f_model(f_U, grad_U, res, gamma)
     tol = 10 * eps(R) * (1 + abs(f_next))
     backtracks = 0
@@ -115,10 +153,10 @@ function backtrack_stepsize!(
         gamma *= reduce_gamma
         backtracks += 1
 
-        learned_trial_step!(model, system, x0, U, grad_U, gamma, q, U_next)
+        learned_trial_step!(model, system, x0, U, grad_U, gamma, q, U_next, projection_relaxation)
 
         @. res = U - U_next
-        f_next, _ = evaluate_cost_gradient(system, x0, U_next)
+        f_next, _ = cost_gradient(U_next)
         f_next_upper = f_model(f_U, grad_U, res, gamma)
         tol = 10 * eps(R) * (1 + abs(f_next))
     end
@@ -134,32 +172,43 @@ end
 function learned_PGM(
     model::ProjectionMLP,
     system::LinearMPC;
-    gamma::Float64 = model.rho,
+    gamma::Float64 = 1.0,
     minimum_gamma::Float64 = 1e-6,
     reduce_gamma::Float64 = 0.5,
     increase_gamma::Float64 = 1.05,
     max_iter::Int = 100,
     tol::Float64 = 1e-6,
     gradient_batch_size::Int = system.nu * system.N,
+    projection_relaxation = nothing,
+    accelerated::Bool = true,
+    adaptive_restart::Bool = false,
 )
     U = zeros(Float64, system.nu, system.N)
+    x = similar(U)
+    z_prev = similar(U)
     q = similar(U)
     U_next = similar(U)
     res = similar(U)
 
     return @inbounds function solver(x0::Vector{Float64}; verbose = false)
         fill!(U, 0.0)
+        fill!(x, 0.0)
+        fill!(z_prev, 0.0)
         current_gamma = gamma
+        theta = 1.0
 
         objective_history = Float64[]
         residual_history = Float64[]
         gamma_history = Float64[]
         backtrack_history = Int[]
         clock_time= 0.0
+        cost_model, constant_cost = learned_cost_cache(system, x0)
+        cost_gradient =
+            U_eval -> learned_cached_cost_gradient(cost_model, constant_cost, system, U_eval)
 
         start_time = time()
         for iter in 1:max_iter
-            cost, grad = evaluate_cost_gradient(system, x0, U)
+            cost, grad = cost_gradient(x)
             current_gamma *= increase_gamma
 
             current_gamma, trial_cost, backtracks = backtrack_stepsize!(
@@ -167,18 +216,20 @@ function learned_PGM(
                 model,
                 system,
                 x0,
-                U,
+                x,
                 cost,
                 grad,
                 q,
                 U_next,
                 res;
+                cost_gradient = cost_gradient,
                 minimum_gamma = minimum_gamma,
                 reduce_gamma = reduce_gamma,
+                projection_relaxation = projection_relaxation,
             )
 
-            @. res = U - U_next
-            residual = norm(res, Inf)
+            @. res = x - U_next
+            residual = norm(res, Inf) / current_gamma
 
             clock_start = time()
             push!(objective_history, trial_cost)
@@ -189,15 +240,24 @@ function learned_PGM(
 
             copyto!(U, U_next)
 
-            if verbose
-                println("Learned PGM iteration $iter: residual = $residual, gamma = $current_gamma")
-            end
-
             if residual <= tol
                 if verbose
                     println("Learned PGM converged at iteration $iter")
                 end
                 break
+            end
+
+            if accelerated
+                if adaptive_restart && real(dot(vec(U_next .- z_prev), vec(x .- U_next))) > 0
+                    theta = 1.0
+                    copyto!(x, U_next)
+                else
+                    theta, beta = nesterov_step(theta)
+                    @. x = U_next + beta * (U_next - z_prev)
+                end
+                copyto!(z_prev, U_next)
+            else
+                copyto!(x, U_next)
             end
         end
 

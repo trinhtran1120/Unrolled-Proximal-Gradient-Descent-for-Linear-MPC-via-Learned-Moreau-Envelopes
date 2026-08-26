@@ -3,8 +3,7 @@ using LinearAlgebra
 using Printf
 using Statistics
 
-using OSQP, Ipopt, Gurobi
-
+using OSQP, Ipopt
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
@@ -16,7 +15,7 @@ function arg_value(name::String, default::String)
     return get(ENV, uppercase(name), default)
 end
 
-solver_name = "Gurobi"
+solver_name = "OSQP"
 tol = 1e-3
 pgm_max_iter = 1000
 learned_pgm_max_iter = 1000
@@ -30,12 +29,12 @@ learned_pgm_reduce_gamma = 0.5
 learned_pgm_increase_gamma = 1.05
 model_path = arg_value(
     "model_path",
-    joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp.json"),
+    joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json"),
 )
 
 mpc_data = mpc_problem()
-x0 = [3.5, 1.5]
-n_batch = 64
+x0 = [1.4, 2.6]
+n_batch = 32
 println(n_batch)
 BLAS.set_num_threads(12)
 
@@ -52,7 +51,8 @@ solve_learned = learned_PGM(
     increase_gamma = learned_pgm_increase_gamma,
     max_iter = learned_pgm_max_iter,
     gradient_batch_size = n_batch,
-    tol = 1e-2,
+    tol = 0.1,
+    adaptive_restart = true,
 )
 
 function max_constraint_violation(problem, U, X)
@@ -111,7 +111,7 @@ J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
 @printf("max |solver X - PGM X| = %8.4e\n\n", maximum(abs.(opt_X - pgm_X)))
 
 println("---------------- learned projection-MLP PGM ----------------")
-learned_sol = solve_learned(x0; verbose = false)
+learned_sol = solve_learned(x0; verbose = true)
 J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 @printf("objective = %10.6f\n", J_learned)
 @printf("solve time = %8.3f ms\n", learned_sol.solve_time * 1000)
