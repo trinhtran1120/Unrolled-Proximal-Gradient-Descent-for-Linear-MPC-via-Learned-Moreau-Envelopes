@@ -7,19 +7,24 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     problem = mpc_problem()
     input_dim = problem.nu * problem.N
     slack_dim = 2 * problem.nx * problem.N
+    Gx = vcat(problem.B_ro, -problem.B_ro)
+    b_offset = vcat(fill(problem.xmax, problem.nx * problem.N), fill(-problem.xmin, problem.nx * problem.N))
+    b_theta = vcat(-problem.A_ro, problem.A_ro)
+    E = hcat(Gx, Matrix{Float64}(I, slack_dim, slack_dim))
+    E_pinv = ((E * E') \ E)'
+    output_bias = vcat(zeros(input_dim), b_offset + b_theta * problem.x0)
     learned_model = ProjectionMLP(
         input_dim,
         problem.nx,
+        slack_dim,
         input_dim + slack_dim,
         [zeros(input_dim + slack_dim, input_dim + problem.nx)],
-        [zeros(input_dim + slack_dim)],
-        zeros(input_dim),
-        ones(input_dim),
-        zeros(problem.nx),
-        ones(problem.nx),
-        vcat(problem.B_ro, -problem.B_ro),
-        vcat(fill(problem.xmax, problem.nx * problem.N), fill(-problem.xmin, problem.nx * problem.N)),
-        vcat(-problem.A_ro, problem.A_ro),
+        [output_bias],
+        Gx,
+        b_offset,
+        b_theta,
+        E,
+        E_pinv,
         0.1,
     )
 
@@ -27,9 +32,8 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     @test learned_model.parameter_dim == problem.nx
 
     U = zeros(problem.nu, problem.N)
-    V_tilde, s_tilde = projection_mlp_corrected(learned_model, vec(U), problem.x0)
-    moreau_value = learned_moreau_value(learned_model, U, problem.x0)
-    moreau_grad = learned_moreau_gradient(learned_model, problem, U, problem.x0)
+    V_tilde, s_tilde = projection_mlp_forward(learned_model, vec(U), problem.x0)
+    moreau_value, moreau_grad = learned_moreau(learned_model, problem, U, problem.x0)
     learned_value, learned_grad = learned_objective_gradient(learned_model, problem, problem.x0, U)
     cost_value, cost_grad = evaluate_cost_gradient(problem, problem.x0, U)
 
@@ -41,13 +45,13 @@ include(joinpath(@__DIR__, "..", "src", "mpc", "learned_pgm.jl"))
     @test all(isfinite, moreau_grad)
     @test learned_value ≈ cost_value + moreau_value
     @test learned_grad ≈ cost_grad .+ moreau_grad
-    @test_throws DimensionMismatch learned_moreau_gradient(
+    @test_throws DimensionMismatch learned_moreau(
         learned_model,
         problem,
         zeros(problem.nu, problem.N + 1),
         problem.x0,
     )
-    @test_throws DimensionMismatch learned_moreau_gradient(
+    @test_throws DimensionMismatch learned_moreau(
         learned_model,
         problem,
         U,

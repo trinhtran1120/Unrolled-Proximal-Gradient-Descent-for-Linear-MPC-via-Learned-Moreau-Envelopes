@@ -49,6 +49,32 @@ def _to_serializable(obj: Any) -> Any:
     return obj
 
 
+def _dense_layer_names(flax_params: Params) -> list[str]:
+    return sorted(flax_params, key=lambda name: int(name.split("_")[1]))
+
+
+def _export_dense_layers(flax_params: Params) -> tuple[list[jnp.ndarray], list[jnp.ndarray]]:
+    weights = []
+    biases = []
+    for name in _dense_layer_names(flax_params):
+        layer = flax_params[name]
+        weights.append(jnp.asarray(layer["kernel"]).T)
+        biases.append(jnp.asarray(layer["bias"]))
+    return weights, biases
+
+
+def to_jsonable(params: Params) -> Any:
+    exported = {key: value for key, value in params.items() if key != "flax_params"}
+    weights, biases = _export_dense_layers(params["flax_params"])
+    exported["weights"] = weights
+    exported["biases"] = biases
+    exported["weight_orientation"] = "out_by_in"
+    exported["activation"] = "gelu"
+    exported["input_order"] = ["model_input", "parameter"]
+    exported["output_order"] = ["V", "s"]
+    return _to_serializable(exported)
+
+
 def _prediction_matrices(a_matrix: np.ndarray, b_matrix: np.ndarray, horizon: int):
     """Build stacked single-shooting prediction matrices."""
     nx, nu = b_matrix.shape

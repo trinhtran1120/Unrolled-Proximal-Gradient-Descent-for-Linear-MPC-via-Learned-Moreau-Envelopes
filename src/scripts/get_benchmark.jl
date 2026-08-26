@@ -3,7 +3,7 @@ using LinearAlgebra
 using Printf
 using Statistics
 
-using OSQP
+using OSQP, Ipopt
 
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
@@ -24,7 +24,6 @@ benchmark_samples = 10
 exact_pgm_rho = 0.1
 exact_pgm_gamma = 0.1
 exact_pgm_adaptive = true
-learned_pgm_rho = 0.1
 learned_pgm_gamma = 0.01
 learned_pgm_minimum_gamma = 1e-6
 learned_pgm_reduce_gamma = 0.5
@@ -35,13 +34,10 @@ model_path = arg_value(
 )
 
 mpc_data = mpc_problem()
-x0 = mpc_data.x0
-n_batch = parse(Int, arg_value("n_batch", string(mpc_data.nu * mpc_data.N)))
-n_threads = 20
-BLAS.set_num_threads(n_threads)
-if Threads.nthreads() != n_threads
-    @warn "Julia worker threads are fixed at startup; rerun with JULIA_NUM_THREADS=$n_threads" active_threads = Threads.nthreads() requested_threads = n_threads
-end
+x0 = [3.5, 1.5]
+n_batch = 64
+println(n_batch)
+BLAS.set_num_threads(12)
 
 solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
 solve_pgm = PGM_solver(mpc_data; gamma = exact_pgm_gamma, adaptive = exact_pgm_adaptive, max_iter = pgm_max_iter, tol = 1e-2)
@@ -56,7 +52,6 @@ solve_learned = learned_PGM(
     increase_gamma = learned_pgm_increase_gamma,
     max_iter = learned_pgm_max_iter,
     gradient_batch_size = n_batch,
-    threaded_gradient = n_threads > 1,
     tol = 1e-2,
 )
 
@@ -85,13 +80,13 @@ println("solver = $solver_name")
 println("exact PGM rho = $exact_pgm_rho")
 println("exact PGM gamma = $exact_pgm_gamma")
 println("exact PGM mode = $(exact_pgm_adaptive ? "adaptive" : "fixed")")
-println("learned adaptive PCF-PGM initial gamma = $learned_pgm_gamma")
-println("learned adaptive PCF-PGM minimum gamma = $learned_pgm_minimum_gamma")
-println("learned adaptive PCF-PGM reduce gamma = $learned_pgm_reduce_gamma")
-println("learned adaptive PCF-PGM increase gamma = $learned_pgm_increase_gamma")
-println("learned PCF-PGM depth = $learned_pgm_max_iter")
+println("learned projection-MLP rho = $(learned_model.rho)")
+println("learned projection-MLP PGM initial gamma = $learned_pgm_gamma")
+println("learned projection-MLP PGM minimum gamma = $learned_pgm_minimum_gamma")
+println("learned projection-MLP PGM reduce gamma = $learned_pgm_reduce_gamma")
+println("learned projection-MLP PGM increase gamma = $learned_pgm_increase_gamma")
+println("learned projection-MLP PGM depth = $learned_pgm_max_iter")
 println("learned gradient batch size = $n_batch")
-println("requested threads = $n_threads")
 println("active Julia threads = $(Threads.nthreads())")
 println("BLAS threads = $(BLAS.get_num_threads())")
 println("learned model = $model_path")
@@ -115,7 +110,7 @@ J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
 @printf("max |solver U - PGM U| = %8.4e\n", maximum(abs.(opt_U - pgm_U)))
 @printf("max |solver X - PGM X| = %8.4e\n\n", maximum(abs.(opt_X - pgm_X)))
 
-println("---------------- learned adaptive PCF-PGM ----------------")
+println("---------------- learned projection-MLP PGM ----------------")
 learned_sol = solve_learned(x0; verbose = false)
 J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 @printf("objective = %10.6f\n", J_learned)
@@ -141,4 +136,4 @@ J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 
 # @printf("%s mean time = %8.3f ms\n", solver_name, mean(solver_times[2:end]) * 1000)
 # @printf("exact PGM mean time = %8.3f ms\n", mean(pgm_times[2:end]) * 1000)
-# @printf("learned adaptive PCF-PGM mean time = %8.3f ms\n", mean(learned_pgm_times[2:end]) * 1000)
+# @printf("learned projection-MLP PGM mean time = %8.3f ms\n", mean(learned_pgm_times[2:end]) * 1000)

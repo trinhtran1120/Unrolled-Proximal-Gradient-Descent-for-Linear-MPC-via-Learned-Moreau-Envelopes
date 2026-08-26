@@ -14,7 +14,7 @@ import nn
 from utils import _prediction_matrices
 
 
-root = Path(__file__).resolve().parents[3]
+root = Path(__file__).resolve().parents[2]
 data_dir = root / "data"
 model_dir = root / "model"
 
@@ -78,52 +78,15 @@ def feasibility_data(metadata):
     horizon = metadata["horizon"]
     a_ro, b_ro = _prediction_matrices(a_matrix, b_matrix, horizon)
     g_matrix = np.vstack((b_ro, -b_ro))
+    E, E_pinv = nn.precompute_projection(jnp.asarray(g_matrix, dtype=dtype))
 
     return {
         "g_matrix": g_matrix,
         "b_offset": np.concatenate((np.full(nx * horizon, xmax), np.full(nx * horizon, -xmin))),
-        "b_theta": np.vstack((-a_ro, a_ro)),
-        "EE_t_inv": np.linalg.inv(g_matrix @ g_matrix.T + np.eye(g_matrix.shape[0])),
+        "b_para": np.vstack((-a_ro, a_ro)),
+        "E": np.asarray(E),
+        "E_pinv": np.asarray(E_pinv),
     }
-
-
-def evaluate(params, model_input, parameter, projection, weight, feas):
-    objective, parts = nn.loss(
-        params,
-        jnp.asarray(model_input, dtype=dtype),
-        jnp.asarray(parameter, dtype=dtype),
-        jnp.asarray(projection, dtype=dtype),
-        jnp.asarray(weight, dtype=dtype),
-        feas,
-        eq_weight,
-        slack_positive_weight,
-    )
-    v_tilde, s_tilde = nn.corrected_projection(
-        params,
-        jnp.asarray(model_input, dtype=dtype),
-        jnp.asarray(parameter, dtype=dtype),
-        feas,
-    )
-    corrected_mse = jnp.mean(jnp.sum((v_tilde - jnp.asarray(projection, dtype=dtype)) ** 2, axis=1))
-    min_slack = jnp.min(s_tilde)
-    return objective, parts, corrected_mse, min_slack
-
-
-def export_params(params, metadata, feas):
-    params = dict(params)
-    params["model_type"] = "projection_mlp"
-    params["target"] = "state_projection"
-    params["mpc"] = {
-        "nx": metadata["nx"],
-        "nu": metadata["nu"],
-        "horizon": metadata["horizon"],
-        "input_dim": metadata["input_dim"],
-        "parameter_dim": metadata["parameter_dim"],
-    }
-    params["feasibility"] = feas
-    params["eq_weight"] = eq_weight
-    params["slack_positive_weight"] = slack_positive_weight
-    return params
 
 
 def save(params, path: Path):
@@ -170,8 +133,31 @@ def main():
         eval_interval=eval_interval,
     )
 
-    params = export_params(params, train_meta, feas)
-    objective, parts, corrected_mse, min_slack = evaluate(params, input_te, parameter_te, projection_te, weight_te, feas)
+    params = {
+        **params,
+        "model_type": "projection_mlp",
+        "target": "state_projection",
+        "mpc": {
+            "nx": train_meta["nx"],
+            "nu": train_meta["nu"],
+            "horizon": train_meta["horizon"],
+            "input_dim": train_meta["input_dim"],
+            "parameter_dim": train_meta["parameter_dim"],
+        },
+        "feasibility": feas,
+        "eq_weight": eq_weight,
+        "slack_positive_weight": slack_positive_weight,
+    }
+
+    input_test = jnp.asarray(input_te, dtype=dtype)
+    parameter_test = jnp.asarray(parameter_te, dtype=dtype)
+    projection_test = jnp.asarray(projection_te, dtype=dtype)
+    weight_test = jnp.asarray(weight_te, dtype=dtype)
+
+    objective, parts = nn.loss(params, input_test, parameter_test, projection_test, weight_test, feas, eq_weight, slack_positive_weight)
+    v_tilde, s_tilde = nn.corrected_projection(params, input_test, parameter_test, feas)
+    corrected_mse = jnp.mean(jnp.sum((v_tilde - projection_test) ** 2, axis=1))
+    min_slack = jnp.min(s_tilde)
     print(
         f"[test] objective: {objective:.4e} | projection mse: {parts[0]:.4e} "
         f"| equality mse: {parts[1]:.4e} | slack mse: {parts[2]:.4e} "
