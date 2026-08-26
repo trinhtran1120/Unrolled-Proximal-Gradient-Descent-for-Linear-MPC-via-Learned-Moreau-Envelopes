@@ -18,12 +18,12 @@ root = Path(__file__).resolve().parents[3]
 data_dir = root / "data"
 model_dir = root / "model"
 
-train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train_adaptive.npz"
-test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test_adaptive.npz"
-model_path = model_dir / "linear-mpc-projection-mlp_adaptive"
+train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train.npz"
+test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test.npz"
+model_path = model_dir / "linear-mpc-projection-mlp"
 
 
-hidden_widths = (64, 64)
+hidden_widths = (32, 32)
 learning_rate = 1e-3
 lr_decay_rate = 0.98
 lr_decay_steps = 10000
@@ -54,9 +54,6 @@ def load_data(path: Path):
             "horizon": int(data["N"]),
             "input_dim": model_input.shape[1],
             "parameter_dim": parameter.shape[1],
-            "adaptive": bool(np.asarray(data["adaptive"]).item()),
-            "rho_initial": float(data["rho_initial"]) if "rho_initial" in data else None,
-            "gamma_initial": float(data["gamma_initial"]) if "gamma_initial" in data else None,
         }
         return model_input, parameter, projection, np.ones(model_input.shape[0]), metadata
 
@@ -103,9 +100,6 @@ def export_params(params, metadata, feas):
     params = dict(params)
     params["model_type"] = "projection_mlp"
     params["target"] = "state_projection"
-    params["rho_initial"] = metadata["rho_initial"]
-    params["gamma_initial"] = metadata["gamma_initial"]
-    params["adaptive_data"] = metadata["adaptive"]
     params["mpc"] = {
         "nx": metadata["nx"],
         "nu": metadata["nu"],
@@ -136,7 +130,6 @@ def main():
 
     print(f"samples: train={input_tr.shape[0]} test={input_te.shape[0]}")
     print(f"dims: input={train_meta['input_dim']} parameter={train_meta['parameter_dim']}")
-    print(f"adaptive data: {train_meta['adaptive']}")
     print(f"weights: projection=1.0 equality={eq_weight} slack_positive={slack_positive_weight}")
 
     params = nn.train(
