@@ -3,7 +3,7 @@ using LinearAlgebra
 using Printf
 using Statistics
 
-using OSQP, Ipopt
+using OSQP, Ipopt, Gurobi
 
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
@@ -16,7 +16,7 @@ function arg_value(name::String, default::String)
     return get(ENV, uppercase(name), default)
 end
 
-solver_name = "OSQP"
+solver_name = "Gurobi"
 tol = 1e-3
 pgm_max_iter = 1000
 learned_pgm_max_iter = 1000

@@ -23,7 +23,7 @@ test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test_adaptive.npz"
 model_path = model_dir / "linear-mpc-projection-mlp"
 
 
-hidden_widths = (32, 32)
+hidden_widths = (64, 64)
 learning_rate = 1e-3
 lr_decay_rate = 0.98
 lr_decay_steps = 10000
