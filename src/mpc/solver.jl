@@ -34,6 +34,7 @@ function mpc_solver(name, problem, tol)
 
     J = @expression(model, sum(cost_func(x[:,k], u[:, k]) for k in 1:N))
     @objective(model, Min, J)
+    optimize!(model)
 
     function solver(init::Vector{Float64}; verbose=false)
         set_parameter_value.(x0, init)

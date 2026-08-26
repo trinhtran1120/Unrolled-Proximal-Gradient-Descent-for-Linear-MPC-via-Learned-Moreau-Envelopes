@@ -2,6 +2,7 @@ using LinearAlgebra
 using ForwardDiff
 using JSON3
 using Random
+using SpecialFunctions: erf
 
 struct Section
     start::Int
@@ -27,13 +28,10 @@ end
 struct ProjectionMLP
     input_dim::Int
     parameter_dim::Int
+    slack_dim::Int
     output_dim::Int
     weights::Vector{Matrix{Float64}}
     biases::Vector{Vector{Float64}}
-    input_mean::Vector{Float64}
-    input_std::Vector{Float64}
-    parameter_mean::Vector{Float64}
-    parameter_std::Vector{Float64}
     Gx::Matrix{Float64}
     b_offset::Vector{Float64}
     b_theta::Matrix{Float64}
@@ -41,6 +39,7 @@ struct ProjectionMLP
 end
 
 softplus(x) = log1p(exp(-abs(x))) + max(x, zero(x))
+gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
 
 function json_matrix(x)
     return Matrix{Float64}(reduce(hcat, Float64.(row) for row in x)')
@@ -94,30 +93,57 @@ function load_pcf(path::AbstractString)
     )
 end
 
+function json_field(data, name::Symbol, default)
+    return hasproperty(data, name) && !isnothing(getproperty(data, name)) ? getproperty(data, name) : default
+end
+
 function load_projection_mlp(path::AbstractString)
     data = JSON3.read(read(path, String))
     data.model_type == "projection_mlp" || throw(ArgumentError("expected model_type = projection_mlp"))
-    data.target == "state_projection" || throw(ArgumentError("expected target = state_projection"))
 
-    normalization = data.normalization
     feasibility = data.feasibility
-    rho = haskey(data, :rho_initial) && !isnothing(data.rho_initial) ? Float64(data.rho_initial) : Float64(data.gamma_initial)
+    rho = Float64(json_field(data, :rho_initial, json_field(data, :rho, json_field(data, :gamma, 1.0))))
 
     return ProjectionMLP(
         Int(data.input_dim),
         Int(data.parameter_dim),
+        Int(data.slack_dim),
         Int(data.output_dim),
         [json_matrix(W) for W in data.weights],
         [json_vector(b) for b in data.biases],
-        json_vector(normalization.input_mean),
-        json_vector(normalization.input_std),
-        json_vector(normalization.parameter_mean),
-        json_vector(normalization.parameter_std),
         json_matrix(feasibility.g_matrix),
         json_vector(feasibility.b_offset),
         json_matrix(feasibility.b_theta),
         rho,
     )
+end
+
+function projection_mlp_forward(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+    length(input) == model.input_dim ||
+        throw(DimensionMismatch("input has length $(length(input)); expected $(model.input_dim)"))
+    length(parameter) == model.parameter_dim ||
+        throw(DimensionMismatch("parameter has length $(length(parameter)); expected $(model.parameter_dim)"))
+
+    z = vcat(input, parameter)
+    for layer in 1:length(model.weights)-1
+        z = gelu.(model.weights[layer] * z .+ model.biases[layer])
+    end
+    return model.weights[end] * z .+ model.biases[end]
+end
+
+function projection_mlp_corrected(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+    z_hat = projection_mlp_forward(model, input, parameter)
+    V_hat = z_hat[1:model.input_dim]
+    s_hat = z_hat[model.input_dim + 1:end]
+    b = model.b_offset .+ model.b_theta * parameter[1:size(model.b_theta, 2)]
+    residual = model.Gx * V_hat .+ s_hat .- b
+    correction = (model.Gx * model.Gx' + I) \ residual
+    return V_hat .- model.Gx' * correction, s_hat .- correction
+end
+
+function projection_mlp_gradient(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+    V_tilde, _ = projection_mlp_corrected(model, input, parameter)
+    return (input .- V_tilde) ./ model.rho
 end
 
 function pcf_psi(model::LearnedPCF, parameter::AbstractVector)

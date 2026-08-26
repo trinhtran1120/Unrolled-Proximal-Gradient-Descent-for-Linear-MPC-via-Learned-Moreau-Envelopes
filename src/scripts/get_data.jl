@@ -98,15 +98,15 @@ function main()
         @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_U)))
     end
 
-    filter_train = filter_zero!(data_train; env_tol = near_zero_env_tol, grad_tol = near_zero_grad_tol, zero_to_nonzero_ratio = zero_to_nonzero_ratio)
-    @printf(
-        "Training samples: %d generated, %d informative, %d near-zero retained, %d near-zero removed, %d total retained\n\n",
-        filter_train.generated,
-        filter_train.informative,
-        filter_train.retained_near_zero,
-        filter_train.removed_near_zero,
-        filter_train.retained,
-    )
+    # filter_train = filter_zero!(data_train; env_tol = near_zero_env_tol, grad_tol = near_zero_grad_tol, zero_to_nonzero_ratio = zero_to_nonzero_ratio)
+    # @printf(
+    #     "Training samples: %d generated, %d informative, %d near-zero retained, %d near-zero removed, %d total retained\n\n",
+    #     filter_train.generated,
+    #     filter_train.informative,
+    #     filter_train.retained_near_zero,
+    #     filter_train.removed_near_zero,
+    #     filter_train.retained,
+    # )
     train_data = Dict{String,Any}(
         "input" => stack_samples(data_train, "input"),
         "parameter" => stack_samples(data_train, "parameter"),

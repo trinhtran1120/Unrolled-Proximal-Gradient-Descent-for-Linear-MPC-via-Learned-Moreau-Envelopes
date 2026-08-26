@@ -57,6 +57,7 @@ Thus the exact condensed MPC problem is
 \end{equation}
 Unlike a unified projection onto $\mathcal U\cap\mathcal C(x_0)$, we retain $\delta_{\mathcal U}$ because its proximal mapping is the inexpensive componentwise clipping operator.
 
+
 \section{Methodology}
 
 \subsection{Moreau-Smoothed State Constraints}
@@ -359,4 +360,3 @@ U-\tilde V
 \end{equation}
 This approximation replaces the exact gradient
 \eqref{eq:MEgrad} in the forward step \eqref{eq:pgm_forward}.
-
