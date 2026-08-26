@@ -19,13 +19,6 @@ Params = dict[str, Any]
 Batch = tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray, jnp.ndarray]
 
 
-def _as_batch(x: jnp.ndarray) -> tuple[jnp.ndarray, bool]:
-    x = jnp.asarray(x, dtype=jnp.float64)
-    if x.ndim == 1:
-        return x[None, :], True
-    return x, False
-
-
 def _batches(
     model_input: jnp.ndarray,
     parameter: jnp.ndarray,
@@ -38,12 +31,6 @@ def _batches(
     for start in range(0, model_input.shape[0], batch_size):
         indices = permutation[start : start + batch_size]
         yield model_input[indices], parameter[indices], projection[indices], weights[indices]
-
-
-def _rand_uniform(key: jax.Array, shape: tuple[int, ...]) -> jnp.ndarray:
-    """Initialize dense parameters with fan-in scaling."""
-    fan_in = shape[-1] if len(shape) > 1 else 1
-    return jax.random.uniform(key, shape, minval=-0.5, maxval=0.5, dtype=jnp.float64) / np.sqrt(fan_in)
 
 
 def _copy_params(params: Params) -> Params:

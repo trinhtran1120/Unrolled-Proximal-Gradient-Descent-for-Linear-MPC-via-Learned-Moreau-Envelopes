@@ -133,7 +133,7 @@ end
 ## objective computation
 function evaluate_cost_gradient(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
     """Evaluate the cost and gradient for a given trajectory"""
-    f = single_shooting(problem, x0)
+    f = single_shooting_cost(problem, x0)
     val_cost, grad = ProximalAlgorithms.value_and_gradient(f, vec(U))
 
     zero_U = zeros(Float64, problem.nu, problem.N)

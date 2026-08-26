@@ -18,8 +18,8 @@ root = Path(__file__).resolve().parents[3]
 data_dir = root / "data"
 model_dir = root / "model"
 
-train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train.npz"
-test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test.npz"
+train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train_adaptive.npz"
+test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test_adaptive.npz"
 model_path = model_dir / "linear-mpc-projection-mlp"
 
 
@@ -27,21 +27,32 @@ hidden_widths = (32, 32)
 learning_rate = 1e-3
 lr_decay_rate = 0.98
 lr_decay_steps = 10000
-eq_weight = 10.0
-slack_positive_weight = 1.0
+eq_weight = 1.0
+slack_positive_weight = 0.1
 l2_reg = 0.0
 batch_size = 128
-epochs = 3000
-eval_interval = 100
+epochs = 5000
+eval_interval = 1000
 seed = 0
 dtype = jnp.float64
 
 
 def load_data(path: Path):
     with np.load(path) as data:
-        model_input = np.asarray(data["input"], dtype=float).T
-        parameter = np.asarray(data["parameter"], dtype=float).T
-        projection = np.asarray(data["proj"], dtype=float).T
+        nx = int(data["nx"])
+        nu = int(data["nu"])
+        horizon = int(data["N"])
+
+        raw_input = np.asarray(data["input"], dtype=float).T
+        if "parameter" in data and "proj" in data:
+            model_input = raw_input
+            parameter = np.asarray(data["parameter"], dtype=float).T
+            projection = np.asarray(data["proj"], dtype=float).T
+        else:
+            input_dim = nu * horizon
+            model_input = raw_input[:, :input_dim]
+            parameter = raw_input[:, input_dim : input_dim + nx]
+            projection = model_input - np.asarray(data["grad"], dtype=float).T
 
         if model_input.shape != projection.shape:
             raise ValueError(f"{path}: input and projection shapes differ: {model_input.shape} vs {projection.shape}")
@@ -49,9 +60,9 @@ def load_data(path: Path):
             raise ValueError(f"{path}: input and parameter sample counts differ")
 
         metadata = {
-            "nx": int(data["nx"]),
-            "nu": int(data["nu"]),
-            "horizon": int(data["N"]),
+            "nx": nx,
+            "nu": nu,
+            "horizon": horizon,
             "input_dim": model_input.shape[1],
             "parameter_dim": parameter.shape[1],
         }
@@ -66,16 +77,18 @@ def feasibility_data(metadata):
     nx = metadata["nx"]
     horizon = metadata["horizon"]
     a_ro, b_ro = _prediction_matrices(a_matrix, b_matrix, horizon)
+    g_matrix = np.vstack((b_ro, -b_ro))
 
     return {
-        "g_matrix": np.vstack((b_ro, -b_ro)),
+        "g_matrix": g_matrix,
         "b_offset": np.concatenate((np.full(nx * horizon, xmax), np.full(nx * horizon, -xmin))),
         "b_theta": np.vstack((-a_ro, a_ro)),
+        "EE_t_inv": np.linalg.inv(g_matrix @ g_matrix.T + np.eye(g_matrix.shape[0])),
     }
 
 
 def evaluate(params, model_input, parameter, projection, weight, feas):
-    objective, parts = nn.projection_loss(
+    objective, parts = nn.loss(
         params,
         jnp.asarray(model_input, dtype=dtype),
         jnp.asarray(parameter, dtype=dtype),
@@ -118,7 +131,7 @@ def save(params, path: Path):
     with Path(f"{path}.pkl").open("wb") as f:
         pickle.dump(params, f)
     with Path(f"{path}.json").open("w") as f:
-        json.dump(nn.ProjectionMLP(params).to_jsonable(), f)
+        json.dump(nn.to_jsonable(params), f)
 
 
 def main():
