@@ -33,8 +33,8 @@ model_path = arg_value(
 )
 
 mpc_data = mpc_problem()
-x0 = [1.4, 2.6]
-n_batch = 32
+x0 = copy(mpc_data.x0)
+n_batch = 256
 println(n_batch)
 BLAS.set_num_threads(12)
 
@@ -58,10 +58,10 @@ solve_learned = learned_PGM(
 function max_constraint_violation(problem, U, X)
     return max(
         0.0,
-        maximum(problem.umin .- U),
-        maximum(U .- problem.umax),
-        maximum(problem.xmin .- X),
-        maximum(X .- problem.xmax),
+        maximum(as_column(problem.umin) .- U),
+        maximum(U .- as_column(problem.umax)),
+        maximum(as_column(problem.xmin) .- X),
+        maximum(X .- as_column(problem.xmax)),
     )
 end
 

@@ -27,7 +27,9 @@ function feasible_initial_states(problem::LinearMPC; solver_name::String, tol::F
     infeasible = Vector{Vector{Float64}}()
 
     for x1 in x1_grid, x2 in x2_grid
-        x0 = [Float64(x1), Float64(x2)]
+        x0 = copy(problem.x0)
+        x0[1] = Float64(x1)
+        x0[2] = Float64(x2)
         if is_feasible(x0)
             push!(feasible, x0)
         else
@@ -41,8 +43,8 @@ end
 function main()
     solver_name = arg_value("solver", "OSQP")
     tol = parse(Float64, arg_value("tol", "1e-6"))
-    x1_grid = parse_range_arg(arg_value("x1", "-5.0:0.1:5.0"))
-    x2_grid = parse_range_arg(arg_value("x2", "-5.0:0.1:5.0"))
+    x1_grid = parse_range_arg(arg_value("x1", "-0.1:0.1:0.1"))
+    x2_grid = parse_range_arg(arg_value("x2", "-0.1:0.1:0.1"))
 
     problem = mpc_problem()
     feasible, infeasible = feasible_initial_states(
@@ -65,7 +67,7 @@ function main()
     println()
     println("feasible x0:")
     for x0 in feasible
-        @printf("[% .6f, % .6f]\n", x0[1], x0[2])
+        println(x0)
     end
 end
 

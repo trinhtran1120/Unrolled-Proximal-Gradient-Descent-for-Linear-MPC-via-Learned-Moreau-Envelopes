@@ -18,8 +18,8 @@ root = Path(__file__).resolve().parents[2]
 data_dir = root / "data"
 model_dir = root / "model"
 
-train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train_adaptive.npz"
-test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test_adaptive.npz"
+train_data_path = data_dir / "PGM-rho=0.1_nx=12_N=10-train_adaptive.npz"
+test_data_path = data_dir / "PGM-rho=0.1_nx=12_N=10-test_adaptive.npz"
 model_path = model_dir / "linear-mpc-projection-mlp_tanh"
 
 
@@ -71,20 +71,57 @@ def load_data(path: Path):
 
 
 def feasibility_data(metadata):
-    a_matrix = np.array([[2.0, -1.0], [1.0, 0.2]], dtype=float)
-    b_matrix = np.array([[1.0], [0.0]], dtype=float)
-    xmin, xmax = -5.0, 5.0
+    a_matrix = np.array(
+        [
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.1, 0.0, 0.0, 0.0],
+            [0.0488, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0016, 0.0, 0.0, 0.0992, 0.0, 0.0],
+            [0.0, -0.0488, 0.0, 0.0, 1.0, 0.0, 0.0, -0.0016, 0.0, 0.0, 0.0992, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0992],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            [0.9734, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0488, 0.0, 0.0, 0.9846, 0.0, 0.0],
+            [0.0, -0.9734, 0.0, 0.0, 0.0, 0.0, 0.0, -0.0488, 0.0, 0.0, 0.9846, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.9846],
+        ],
+        dtype=float,
+    )
+    b_matrix = np.array(
+        [
+            [0.0, -0.0726, 0.0, 0.0726],
+            [-0.0726, 0.0, 0.0726, 0.0],
+            [-0.0152, 0.0152, -0.0152, 0.0152],
+            [0.0, -0.0006, -0.0000, 0.0006],
+            [0.0006, 0.0, -0.0006, 0.0],
+            [0.0106, 0.0106, 0.0106, 0.0106],
+            [0.0, -1.4512, 0.0, 1.4512],
+            [-1.4512, 0.0, 1.4512, 0.0],
+            [-0.3049, 0.3049, -0.3049, 0.3049],
+            [0.0, -0.0236, 0.0, 0.0236],
+            [0.0236, 0.0, -0.0236, 0.0],
+            [0.2107, 0.2107, 0.2107, 0.2107],
+        ],
+        dtype=float,
+    )
+    xmin = np.array([-np.pi / 6, -np.pi / 6, -np.inf, -np.inf, -np.inf, -1.0, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf, -np.inf])
+    xmax = np.array([np.pi / 6, np.pi / 6, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf, np.inf])
 
     nx = metadata["nx"]
     horizon = metadata["horizon"]
     a_ro, b_ro = _prediction_matrices(a_matrix, b_matrix, horizon)
-    g_matrix = np.vstack((b_ro, -b_ro))
+    xmin_stacked = np.tile(xmin, horizon)
+    xmax_stacked = np.tile(xmax, horizon)
+    upper_idx = np.flatnonzero(np.isfinite(xmax_stacked))
+    lower_idx = np.flatnonzero(np.isfinite(xmin_stacked))
+    g_matrix = np.vstack((b_ro[upper_idx, :], -b_ro[lower_idx, :]))
     E, E_pinv = nn.precompute_projection(jnp.asarray(g_matrix, dtype=dtype))
 
     return {
         "g_matrix": g_matrix,
-        "b_offset": np.concatenate((np.full(nx * horizon, xmax), np.full(nx * horizon, -xmin))),
-        "b_para": np.vstack((-a_ro, a_ro)),
+        "b_offset": np.concatenate((xmax_stacked[upper_idx], -xmin_stacked[lower_idx])),
+        "b_para": np.vstack((-a_ro[upper_idx, :], a_ro[lower_idx, :])),
         "E": np.asarray(E),
         "E_pinv": np.asarray(E_pinv),
     }

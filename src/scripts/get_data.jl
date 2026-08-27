@@ -24,9 +24,9 @@ const solver_tol = 1e-6
 #PGM algorithm settings
 const pgm_tol = 1e-2
 const pgm_rho = 0.1
-const pgm_gamma = 0.001
+const pgm_gamma = 0.1
 const pgm_adaptive = true
-const pgm_max_iter = 1000
+const pgm_max_iter = 2000
 
 # Tolerances for down-sampling near-zero Moreau envelopes and gradients
 const near_zero_env_tol = 1e-12
@@ -36,6 +36,33 @@ const zero_to_nonzero_ratio = 0.1
 function stack_samples(data, key)
     isempty(data[key]) && error("No samples collected for `$key`; check the feasible initial-state pool and PGM settings.")
     return reduce(hcat, data[key])
+end
+
+function initial_state_with_offsets(problem::LinearMPC, offsets::Pair{Int,Float64}...)
+    init = copy(problem.x0)
+    for (idx, value) in offsets
+        init[idx] = value
+    end
+    return init
+end
+
+function candidate_initial_states(problem::LinearMPC)
+    return [
+        copy(problem.x0),
+        initial_state_with_offsets(problem, 1 => 0.10),
+        initial_state_with_offsets(problem, 2 => -0.10),
+        initial_state_with_offsets(problem, 3 => 0.80),
+        initial_state_with_offsets(problem, 3 => 1.20),
+        initial_state_with_offsets(problem, 7 => 0.20, 8 => -0.20),
+        initial_state_with_offsets(problem, 9 => 0.20),
+        initial_state_with_offsets(problem, 10 => 0.10, 11 => -0.10, 12 => 0.10),
+    ]
+end
+
+function trajectory_cost(problem::LinearMPC, X::Matrix{Float64}, U::Matrix{Float64})
+    terminal_dx = X[:, problem.N+1] - problem.xr
+    return sum(problem.cost_func(X[:, k], U[:, k]) for k in 1:problem.N) +
+           dot(terminal_dx, problem.QN * terminal_dx)
 end
 
 function main()
@@ -51,21 +78,12 @@ function main()
         max_iter = pgm_max_iter,
         tol = pgm_tol,
     )
-    cost_func = mpc_data.cost_func
-
     data_train = Dict("input" => Vector{Float64}[], "parameter" => Vector{Float64}[], "proj" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
     data_test = Dict("input" => Vector{Float64}[], "parameter" => Vector{Float64}[], "proj" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
 
     is_feasible = initialization(feasibility_solver_name, mpc_data, solver_tol)
 
-    x1_grid = -2.0:0.5:3.0
-    x2_grid = -2.0:0.5:4.0
-    initial_pool = [
-        [Float64(x1), Float64(x2)]
-        for x1 in x1_grid
-        for x2 in x2_grid
-        if !isapprox([x1, x2], [0.0, 0.0]; atol = 1e-12) && is_feasible([Float64(x1), Float64(x2)])
-    ]
+    initial_pool = [x0 for x0 in candidate_initial_states(mpc_data) if is_feasible(x0)]
     split_idx = round(Int, 0.8 * length(initial_pool))
     isempty(initial_pool) && error("No feasible initial states found; try a different feasibility solver or a wider grid.")
 
@@ -83,7 +101,7 @@ function main()
 
         println("---------------- PGM ----------------")
         pgm_U, pgm_X, _ = solve_pgm(x0; data = data_train, verbose = true)
-        J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
+        J_PGM = trajectory_cost(mpc_data, pgm_X, pgm_U)
         delta_J = abs(J_opt - J_PGM)
 
         optimality_gap = if abs(J_opt) <= eps(Float64)
@@ -119,7 +137,7 @@ function main()
     for x0 in test_pool
         println("================ Collecting testing data with initial state = $x0 ================")
         pgm_U, pgm_X, _ = solve_pgm(x0; data = data_test, verbose = true)
-        J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
+        J_PGM = trajectory_cost(mpc_data, pgm_X, pgm_U)
         @printf("J_PGM = %8.4f\n", J_PGM)
     end
 

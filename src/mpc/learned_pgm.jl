@@ -75,7 +75,9 @@ function learned_cost_cache(system::LinearMPC, x0::Vector{Float64})
     cost = single_shooting_cost(system, x0)
     zero_U = zeros(Float64, system.nu, system.N)
     zero_X = rollout(system, x0, zero_U)
-    constant_cost = sum(system.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:system.N)
+    terminal_dx = zero_X[:, system.N+1] - system.xr
+    constant_cost = sum(system.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:system.N) +
+                    dot(terminal_dx, system.QN * terminal_dx)
     return cost, constant_cost
 end
 
@@ -120,7 +122,9 @@ function learned_trial_step!(
     @. q = U - gamma * grad_U
     grad_g = learned_grad(model, system, q, x0)
     scale = learned_correction_scale(model, gamma, projection_relaxation)
-    @. U_next = clamp(q - scale * grad_g, system.umin, system.umax)
+    umin = as_column(system.umin)
+    umax = as_column(system.umax)
+    @. U_next = clamp(q - scale * grad_g, umin, umax)
     return U_next
 end
 

@@ -51,8 +51,12 @@ function StateConstraint(name, problem, tol::Float64 = 1e-8)
     @variable(model, U_ref[i in 1:nu * N] in MOI.Parameter(0.0))
 
     X = A_ro * x0 + B_ro * V
-    @constraint(model, X .<= fill(xmax, nx * N))
-    @constraint(model, fill(xmin, nx * N) .<= X)
+    xmin_stacked = repeat_horizon(xmin, N)
+    xmax_stacked = repeat_horizon(xmax, N)
+    finite_lower = findall(isfinite, xmin_stacked)
+    finite_upper = findall(isfinite, xmax_stacked)
+    @constraint(model, [i in finite_upper], X[i] <= xmax_stacked[i])
+    @constraint(model, [i in finite_lower], xmin_stacked[i] <= X[i])
     @objective(model, Min, 0.5 * sum((V[i] - U_ref[i])^2 for i in 1:nu * N))
 
     function solver(init::Vector{Float64}, q::AbstractVector{Float64}; verbose = false)
@@ -93,23 +97,26 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
     A_ro = problem.A_ro
     B_ro = problem.B_ro
     Q = problem.Q
+    QN = problem.QN
     R = problem.R
+    xr = problem.xr
             
     H = zeros(Float64, N*nu, N*nu)
     h = zeros(Float64, N*nu)
 
-    for k in 1:N-1
+    for k in 1:N
         x_idx = ((k - 1) * nx + 1) : (k * nx)
         Ak = view(A_ro, x_idx, :)
         Bk = view(B_ro, x_idx, :)
+        W = k == N ? QN : Q
 
-        H .+= Bk' * Q * Bk
-        h .+= Bk' * Q * Ak * x0
+        H .+= 2.0 * Bk' * W * Bk
+        h .+= 2.0 * Bk' * W * (Ak * x0 - xr)
     end
 
     for k in 1:N
         u_idx = ((k - 1) * nu + 1) : (k * nu)
-        H[u_idx, u_idx] .+= R 
+        H[u_idx, u_idx] .+= 2.0 * R
     end
 
     return DifferentiableQuadratic(H, h)
@@ -176,7 +183,9 @@ function evaluate_cost_gradient(problem::LinearMPC, x0::Vector{Float64}, U::Matr
     zero_U = zeros(Float64, problem.nu, problem.N)
     zero_X = rollout(problem, x0, zero_U)
 
-    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N)
+    terminal_dx = zero_X[:, problem.N+1] - problem.xr
+    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N) +
+                    dot(terminal_dx, problem.QN * terminal_dx)
 
     return val_cost + constant_cost, reshape(grad, problem.nu, problem.N)
 end
@@ -199,8 +208,12 @@ function StateConstraint(name::String, problem::LinearMPC, tol::Float64)
 
     # State bound
     X = A_ro * x0 + B_ro * V
-    @constraint(model, X .<= fill(xmax, nx* N))
-    @constraint(model, fill(xmin, nx*N) .<= X)
+    xmin_stacked = repeat_horizon(xmin, N)
+    xmax_stacked = repeat_horizon(xmax, N)
+    finite_lower = findall(isfinite, xmin_stacked)
+    finite_upper = findall(isfinite, xmax_stacked)
+    @constraint(model, [i in finite_upper], X[i] <= xmax_stacked[i])
+    @constraint(model, [i in finite_lower], xmin_stacked[i] <= X[i])
     @objective(model, Min, 0.5*sum((V[i] - U_ref[i])^2 for i in 1:N*nu))
     optimize!(model)
 
@@ -237,8 +250,8 @@ function PGM_solver(
     u0 = zeros(Float64, nu * N)
     u_solution = copy(u0)
     input_constraint = ProximalOperators.IndBox(
-        fill(problem.umin, nu * N),
-        fill(problem.umax, nu * N),
+        repeat_horizon(problem.umin, N),
+        repeat_horizon(problem.umax, N),
     )
     project = StateConstraint("OSQP", problem, 1e-6)
 

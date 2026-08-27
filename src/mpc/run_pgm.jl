@@ -7,10 +7,10 @@ include(joinpath(@__DIR__, "solver.jl"))
 function max_constraint_violation(problem::LinearMPC, U::Matrix{Float64}, X::Matrix{Float64})
     return max(
         0.0,
-        maximum(problem.umin .- U),
-        maximum(U .- problem.umax),
-        maximum(problem.xmin .- X),
-        maximum(X .- problem.xmax),
+        maximum(as_column(problem.umin) .- U),
+        maximum(U .- as_column(problem.umax)),
+        maximum(as_column(problem.xmin) .- X),
+        maximum(X .- as_column(problem.xmax)),
     )
 end
 
