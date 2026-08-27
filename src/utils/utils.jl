@@ -76,11 +76,6 @@ function load_projection_mlp(path::AbstractString)
 end
 
 function projection_mlp_forward(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
-    length(input) == model.input_dim ||
-        throw(DimensionMismatch("input has length $(length(input)); expected $(model.input_dim)"))
-    length(parameter) == model.parameter_dim ||
-        throw(DimensionMismatch("parameter has length $(length(parameter)); expected $(model.parameter_dim)"))
-
     z = vcat(input, parameter)
     for layer in 1:length(model.weights)-1
         z = activate.(model.weights[layer] * z .+ model.biases[layer], Ref(model.activation))

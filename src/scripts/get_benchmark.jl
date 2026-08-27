@@ -7,13 +7,6 @@ using OSQP, Ipopt
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
-function arg_value(name::String, default::String)
-    prefix = "--$name="
-    for arg in ARGS
-        startswith(arg, prefix) && return arg[length(prefix)+1:end]
-    end
-    return get(ENV, uppercase(name), default)
-end
 
 solver_name = "OSQP"
 tol = 1e-3
@@ -27,10 +20,7 @@ learned_pgm_gamma = 0.01
 learned_pgm_minimum_gamma = 1e-6
 learned_pgm_reduce_gamma = 0.5
 learned_pgm_increase_gamma = 1.05
-model_path = arg_value(
-    "model_path",
-    joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json"),
-)
+model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json")
 
 mpc_data = mpc_problem()
 x0 = [1.4, 2.6]
@@ -52,7 +42,7 @@ solve_learned = learned_PGM(
     max_iter = learned_pgm_max_iter,
     gradient_batch_size = n_batch,
     tol = 0.1,
-    adaptive_restart = true,
+    accelerated = true,
 )
 
 function max_constraint_violation(problem, U, X)

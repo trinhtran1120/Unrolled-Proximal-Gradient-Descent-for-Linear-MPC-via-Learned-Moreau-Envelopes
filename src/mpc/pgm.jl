@@ -116,6 +116,27 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
 
 end
 
+function cost_cache(problem::LinearMPC, x0::Vector{Float64})
+    f = single_shooting_cost(problem, x0)
+    zero_U = zeros(Float64, problem.nu, problem.N)
+    zero_X = rollout(problem, x0, zero_U)
+    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N)
+    return f, constant_cost
+end
+
+function cached_cost_gradient(
+    f::DifferentiableQuadratic,
+    constant_cost::Float64,
+    problem::LinearMPC,
+    U::Matrix{Float64},
+)
+    input = vec(U)
+    Hu = f.H * input
+    grad = Hu .+ f.h
+    value = 0.5 * dot(input, Hu) + dot(f.h, input) + constant_cost
+    return value, reshape(grad, problem.nu, problem.N)
+end
+
 ## Moreau Envelope
 struct MoreauEnvelope
     cost::DifferentiableQuadratic
@@ -170,15 +191,8 @@ end
 ## objective computation
 function evaluate_cost_gradient(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
     """Evaluate the cost and gradient for a given trajectory"""
-    f = single_shooting_cost(problem, x0)
-    val_cost, grad = ProximalAlgorithms.value_and_gradient(f, vec(U))
-
-    zero_U = zeros(Float64, problem.nu, problem.N)
-    zero_X = rollout(problem, x0, zero_U)
-
-    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N)
-
-    return val_cost + constant_cost, reshape(grad, problem.nu, problem.N)
+    f, constant_cost = cost_cache(problem, x0)
+    return cached_cost_gradient(f, constant_cost, problem, U)
 end
 
 
