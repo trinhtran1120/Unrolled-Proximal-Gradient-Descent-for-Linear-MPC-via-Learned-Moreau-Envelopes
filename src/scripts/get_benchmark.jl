@@ -7,34 +7,24 @@ using OSQP, Ipopt
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
-function arg_value(name::String, default::String)
-    prefix = "--$name="
-    for arg in ARGS
-        startswith(arg, prefix) && return arg[length(prefix)+1:end]
-    end
-    return get(ENV, uppercase(name), default)
-end
 
 solver_name = "OSQP"
 tol = 1e-3
 pgm_max_iter = 1000
 learned_pgm_max_iter = 1000
 benchmark_samples = 10
-exact_pgm_rho = 0.1
 exact_pgm_gamma = 0.1
 exact_pgm_adaptive = true
 learned_pgm_gamma = 0.01
 learned_pgm_minimum_gamma = 1e-6
 learned_pgm_reduce_gamma = 0.5
 learned_pgm_increase_gamma = 1.05
-model_path = arg_value(
-    "model_path",
-    joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json"),
-)
+learned_moreau_gamma = 1.
+model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json")
 
 mpc_data = mpc_problem()
-x0 = copy(mpc_data.x0)
-n_batch = 256
+x0 = mpc_data.x0
+n_batch = mpc_data.nu * mpc_data.N
 println(n_batch)
 BLAS.set_num_threads(12)
 
@@ -51,8 +41,9 @@ solve_learned = learned_PGM(
     increase_gamma = learned_pgm_increase_gamma,
     max_iter = learned_pgm_max_iter,
     gradient_batch_size = n_batch,
+    moreau_gamma = learned_moreau_gamma,
     tol = 0.1,
-    adaptive_restart = true,
+    accelerated = true,
 )
 
 function max_constraint_violation(problem, U, X)
@@ -77,14 +68,13 @@ println("================ Open-loop linear MPC benchmark ================")
 println("initial state = $x0")
 println("horizon N = $(mpc_data.N)")
 println("solver = $solver_name")
-println("exact PGM rho = $exact_pgm_rho")
 println("exact PGM gamma = $exact_pgm_gamma")
 println("exact PGM mode = $(exact_pgm_adaptive ? "adaptive" : "fixed")")
-println("learned projection-MLP rho = $(learned_model.rho)")
 println("learned projection-MLP PGM initial gamma = $learned_pgm_gamma")
 println("learned projection-MLP PGM minimum gamma = $learned_pgm_minimum_gamma")
 println("learned projection-MLP PGM reduce gamma = $learned_pgm_reduce_gamma")
 println("learned projection-MLP PGM increase gamma = $learned_pgm_increase_gamma")
+println("learned projection-MLP Moreau gamma = $learned_moreau_gamma")
 println("learned projection-MLP PGM depth = $learned_pgm_max_iter")
 println("learned gradient batch size = $n_batch")
 println("active Julia threads = $(Threads.nthreads())")
@@ -100,15 +90,15 @@ opt_X, opt_U, solver_time, J_opt = solve_mpc(x0; verbose = false)
 @printf("objective = %10.6f\n", J_opt)
 @printf("solve time = %8.3f ms\n\n", solver_time * 1000)
 
-println("---------------- exact PGM ----------------")
-pgm_time = @elapsed pgm_U, pgm_X, _ = solve_pgm(x0; verbose = true)
-J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
-@printf("objective = %10.6f\n", J_pgm)
-@printf("solve time = %8.3f ms\n", pgm_time * 1000)
-@printf("relative objective gap = %8.4f%%\n", relative_objective_gap(J_opt, J_pgm))
-@printf("max constraint violation = %8.4e\n", max_constraint_violation(mpc_data, pgm_U, pgm_X))
-@printf("max |solver U - PGM U| = %8.4e\n", maximum(abs.(opt_U - pgm_U)))
-@printf("max |solver X - PGM X| = %8.4e\n\n", maximum(abs.(opt_X - pgm_X)))
+# println("---------------- exact PGM ----------------")
+# pgm_time = @elapsed pgm_U, pgm_X, _ = solve_pgm(x0; verbose = true)
+# J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
+# @printf("objective = %10.6f\n", J_pgm)
+# @printf("solve time = %8.3f ms\n", pgm_time * 1000)
+# @printf("relative objective gap = %8.4f%%\n", relative_objective_gap(J_opt, J_pgm))
+# @printf("max constraint violation = %8.4e\n", max_constraint_violation(mpc_data, pgm_U, pgm_X))
+# @printf("max |solver U - PGM U| = %8.4e\n", maximum(abs.(opt_U - pgm_U)))
+# @printf("max |solver X - PGM X| = %8.4e\n\n", maximum(abs.(opt_X - pgm_X)))
 
 println("---------------- learned projection-MLP PGM ----------------")
 learned_sol = solve_learned(x0; verbose = true)

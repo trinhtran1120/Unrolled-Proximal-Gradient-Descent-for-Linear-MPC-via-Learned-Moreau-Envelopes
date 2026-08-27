@@ -21,14 +21,12 @@ x0 = problem.x0
 
 solver_name = "OSQP"
 tol = 1e-6
-rho = 0.1
 gamma = 0.01
 max_iter = 100
 
 solve_mpc = mpc_solver(solver_name, problem, tol)
 solve_pgm = PGM_solver(
     problem;
-    rho = rho,
     gamma = gamma,
     adaptive = true,
     max_iter = max_iter,

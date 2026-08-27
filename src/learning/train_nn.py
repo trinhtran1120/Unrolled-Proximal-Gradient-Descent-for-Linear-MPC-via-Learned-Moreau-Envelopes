@@ -18,8 +18,8 @@ root = Path(__file__).resolve().parents[2]
 data_dir = root / "data"
 model_dir = root / "model"
 
-train_data_path = data_dir / "PGM-rho=0.1_nx=12_N=10-train_adaptive.npz"
-test_data_path = data_dir / "PGM-rho=0.1_nx=12_N=10-test_adaptive.npz"
+train_data_path = data_dir / "PGM_nx=12_N=20-train_adaptive.npz"
+test_data_path = data_dir / "PGM_nx=12_N=20-test_adaptive.npz"
 model_path = model_dir / "linear-mpc-projection-mlp_tanh"
 
 

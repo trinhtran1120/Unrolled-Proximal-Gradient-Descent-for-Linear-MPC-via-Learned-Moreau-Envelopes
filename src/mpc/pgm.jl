@@ -51,12 +51,12 @@ function StateConstraint(name, problem, tol::Float64 = 1e-8)
     @variable(model, U_ref[i in 1:nu * N] in MOI.Parameter(0.0))
 
     X = A_ro * x0 + B_ro * V
-    xmin_stacked = repeat_horizon(xmin, N)
-    xmax_stacked = repeat_horizon(xmax, N)
-    finite_lower = findall(isfinite, xmin_stacked)
-    finite_upper = findall(isfinite, xmax_stacked)
-    @constraint(model, [i in finite_upper], X[i] <= xmax_stacked[i])
-    @constraint(model, [i in finite_lower], xmin_stacked[i] <= X[i])
+    x_upper = repeat_horizon(xmax, N)
+    x_lower = repeat_horizon(xmin, N)
+    for i in eachindex(x_upper)
+        isfinite(x_upper[i]) && @constraint(model, X[i] <= x_upper[i])
+        isfinite(x_lower[i]) && @constraint(model, x_lower[i] <= X[i])
+    end
     @objective(model, Min, 0.5 * sum((V[i] - U_ref[i])^2 for i in 1:nu * N))
 
     function solver(init::Vector{Float64}, q::AbstractVector{Float64}; verbose = false)
@@ -97,7 +97,6 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
     A_ro = problem.A_ro
     B_ro = problem.B_ro
     Q = problem.Q
-    QN = problem.QN
     R = problem.R
     xr = problem.xr
             
@@ -108,10 +107,9 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
         x_idx = ((k - 1) * nx + 1) : (k * nx)
         Ak = view(A_ro, x_idx, :)
         Bk = view(B_ro, x_idx, :)
-        W = k == N ? QN : Q
 
-        H .+= 2.0 * Bk' * W * Bk
-        h .+= 2.0 * Bk' * W * (Ak * x0 - xr)
+        H .+= 2.0 * Bk' * Q * Bk
+        h .+= 2.0 * Bk' * Q * (Ak * x0 - xr)
     end
 
     for k in 1:N
@@ -123,12 +121,31 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
 
 end
 
+function cost_cache(problem::LinearMPC, x0::Vector{Float64})
+    f = single_shooting_cost(problem, x0)
+    zero_U = zeros(Float64, problem.nu, problem.N)
+    zero_X = rollout(problem, x0, zero_U)
+    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N) +
+                    problem.cost_func(zero_X[:, problem.N+1], zeros(Float64, problem.nu))
+    return f, constant_cost
+end
+
+function cached_cost_gradient(
+    f::DifferentiableQuadratic,
+    constant_cost::Float64,
+    problem::LinearMPC,
+    U::Matrix{Float64},
+)
+    input = vec(U)
+    value, grad = ProximalAlgorithms.value_and_gradient(f, input)
+    return value + constant_cost, reshape(grad, problem.nu, problem.N)
+end
+
 ## Moreau Envelope
 struct MoreauEnvelope
     cost::DifferentiableQuadratic
     project::Function
     x0::Vector{Float64}
-    rho::Float64
     data
 end
 
@@ -144,7 +161,7 @@ function ProximalAlgorithms.value_and_gradient(f::MoreauEnvelope, u)
     For a feasible input set C(x0), this evaluates the quadratic cost plus the
     Moreau envelope of the indicator function I_C:
 
-        M_rho I_C(u) = min_{v in C(x0)} (1 / 2) ||v - u||_2^2
+        M I_C(u) = min_{v in C(x0)} (1 / 2) ||v - u||_2^2
 
     with projection
 
@@ -152,16 +169,16 @@ function ProximalAlgorithms.value_and_gradient(f::MoreauEnvelope, u)
 
     The returned value and gradient are
 
-        phi(u) = l(u) + (1 / rho) M_rho I_C(u)
-        grad phi(u) = grad l(u) + (1 / rho) (u - p),
+        phi(u) = l(u) + M I_C(u)
+        grad phi(u) = grad l(u) + (u - p),
 
     where l(u) = f.cost(u).
     """
     cost_value, cost_grad = ProximalAlgorithms.value_and_gradient(f.cost, u)
     projected_u, distance_value = f.project(f.x0, u)
     distance_grad = u .- projected_u
-    value = cost_value + distance_value /f.rho
-    grad = cost_grad .+ distance_grad ./ f.rho
+    value = cost_value + distance_value
+    grad = cost_grad .+ distance_grad
 
     if f.data !== nothing
         push!(f.data["input"], copy(u))
@@ -177,17 +194,8 @@ end
 ## objective computation
 function evaluate_cost_gradient(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
     """Evaluate the cost and gradient for a given trajectory"""
-    f = single_shooting_cost(problem, x0)
-    val_cost, grad = ProximalAlgorithms.value_and_gradient(f, vec(U))
-
-    zero_U = zeros(Float64, problem.nu, problem.N)
-    zero_X = rollout(problem, x0, zero_U)
-
-    terminal_dx = zero_X[:, problem.N+1] - problem.xr
-    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N) +
-                    dot(terminal_dx, problem.QN * terminal_dx)
-
-    return val_cost + constant_cost, reshape(grad, problem.nu, problem.N)
+    f, constant_cost = cost_cache(problem, x0)
+    return cached_cost_gradient(f, constant_cost, problem, U)
 end
 
 
@@ -208,12 +216,12 @@ function StateConstraint(name::String, problem::LinearMPC, tol::Float64)
 
     # State bound
     X = A_ro * x0 + B_ro * V
-    xmin_stacked = repeat_horizon(xmin, N)
-    xmax_stacked = repeat_horizon(xmax, N)
-    finite_lower = findall(isfinite, xmin_stacked)
-    finite_upper = findall(isfinite, xmax_stacked)
-    @constraint(model, [i in finite_upper], X[i] <= xmax_stacked[i])
-    @constraint(model, [i in finite_lower], xmin_stacked[i] <= X[i])
+    x_upper = repeat_horizon(xmax, N)
+    x_lower = repeat_horizon(xmin, N)
+    for i in eachindex(x_upper)
+        isfinite(x_upper[i]) && @constraint(model, X[i] <= x_upper[i])
+        isfinite(x_lower[i]) && @constraint(model, x_lower[i] <= X[i])
+    end
     @objective(model, Min, 0.5*sum((V[i] - U_ref[i])^2 for i in 1:N*nu))
     optimize!(model)
 
@@ -236,7 +244,6 @@ end
 ## PGM 
 function PGM_solver(
     problem::LinearMPC;
-    rho::Float64 = 0.1,
     gamma::Float64 = 0.1,
     adaptive::Bool=true,
     minimum_gamma::Float64=1e-6,
@@ -257,7 +264,7 @@ function PGM_solver(
 
     return @inbounds function solver(x0::Vector{Float64}; data = nothing, verbose = false)
         cost = single_shooting_cost(problem, x0)
-        f = MoreauEnvelope(cost, project, x0, rho, data)
+        f = MoreauEnvelope(cost, project, x0, data)
 
         ffb_iter = ProximalAlgorithms.FastForwardBackwardIteration(
             f = f,
@@ -292,7 +299,7 @@ function PGM_solver(
 
         U = reshape(u_solution, nu, N)
         X = rollout(problem, x0, U)
-        final_f = MoreauEnvelope(cost, project, x0, rho, nothing)
+        final_f = MoreauEnvelope(cost, project, x0, nothing)
         objective = final_f(u_solution)
 
         return U, X, objective

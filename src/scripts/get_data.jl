@@ -22,11 +22,10 @@ feasibility_solver_name = "OSQP"
 const solver_tol = 1e-6
 
 #PGM algorithm settings
-const pgm_tol = 1e-2
-const pgm_rho = 0.1
-const pgm_gamma = 0.1
+const pgm_tol = 1e-1
+const pgm_gamma = 1.0
 const pgm_adaptive = true
-const pgm_max_iter = 2000
+const pgm_max_iter = 5000
 
 # Tolerances for down-sampling near-zero Moreau envelopes and gradients
 const near_zero_env_tol = 1e-12
@@ -52,17 +51,16 @@ function candidate_initial_states(problem::LinearMPC)
         initial_state_with_offsets(problem, 1 => 0.10),
         initial_state_with_offsets(problem, 2 => -0.10),
         initial_state_with_offsets(problem, 3 => 0.80),
-        initial_state_with_offsets(problem, 3 => 1.20),
-        initial_state_with_offsets(problem, 7 => 0.20, 8 => -0.20),
-        initial_state_with_offsets(problem, 9 => 0.20),
-        initial_state_with_offsets(problem, 10 => 0.10, 11 => -0.10, 12 => 0.10),
+        # initial_state_with_offsets(problem, 3 => 1.20),
+        # initial_state_with_offsets(problem, 7 => 0.20, 8 => -0.20),
+        # initial_state_with_offsets(problem, 9 => 0.20),
+        # initial_state_with_offsets(problem, 10 => 0.10, 11 => -0.10, 12 => 0.10),
     ]
 end
 
 function trajectory_cost(problem::LinearMPC, X::Matrix{Float64}, U::Matrix{Float64})
-    terminal_dx = X[:, problem.N+1] - problem.xr
     return sum(problem.cost_func(X[:, k], U[:, k]) for k in 1:problem.N) +
-           dot(terminal_dx, problem.QN * terminal_dx)
+           problem.cost_func(X[:, problem.N+1], zeros(Float64, problem.nu))
 end
 
 function main()
@@ -72,7 +70,6 @@ function main()
     solve_mpc = mpc_solver(solver_name, mpc_data, solver_tol)
     solve_pgm = PGM_solver(
         mpc_data;
-        rho = pgm_rho,
         gamma = pgm_gamma,
         adaptive = pgm_adaptive,
         max_iter = pgm_max_iter,
@@ -126,11 +123,10 @@ function main()
         "N" => mpc_data.N,
         "nx" => mpc_data.nx,
         "nu" => mpc_data.nu,
-        "rho_initial" => pgm_rho,
         "gamma_initial" => pgm_gamma,
     )
     npzwrite(
-        joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
+        joinpath(DATASET_DIR, "PGM_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
         train_data,
     )
 
@@ -152,11 +148,10 @@ function main()
         "N" => mpc_data.N,
         "nx" => mpc_data.nx,
         "nu" => mpc_data.nu,
-        "rho_initial" => pgm_rho,
         "gamma_initial" => pgm_gamma,
     )
     npzwrite(
-        joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
+        joinpath(DATASET_DIR, "PGM_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
         test_data,
     )
 end

@@ -45,7 +45,6 @@ struct LinearMPC
     A::Matrix{Float64}
     B::Matrix{Float64}
     Q::Matrix{Float64}
-    QN::Matrix{Float64}
     R::Matrix{Float64}
 
     x0::Vector{Float64}
@@ -96,7 +95,6 @@ function mpc_problem()
         0.2107   0.2107   0.2107   0.2107
     ]
     Q = Diagonal([0.0, 0.0, 10.0, 10.0, 10.0, 10.0, 0.0, 0.0, 0.0, 5.0, 5.0, 5.0]) |> Matrix
-    QN = Q
     R = 0.1 * speye(size(B, 2))
 
     xr = [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
@@ -111,7 +109,7 @@ function mpc_problem()
 
     nx = size(A, 1)
     nu = size(B, 2)
-    N = 30
+    N = 20
 
     cost_func = StageCost(Q, R, xr)
     A_ro, B_ro = convert_matrix(A, B, N)
@@ -120,7 +118,6 @@ function mpc_problem()
         A,
         B,
         Q,
-        QN,
         R,
         x0,
         xr,

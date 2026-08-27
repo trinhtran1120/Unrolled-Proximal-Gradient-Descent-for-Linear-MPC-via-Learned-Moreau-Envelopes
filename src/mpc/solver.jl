@@ -20,8 +20,7 @@ function mpc_solver(name, problem, tol)
     nu = problem.nu
     N = problem.N
     cost_func = problem.cost_func
-    QN = problem.QN
-    xr = problem.xr
+    zero_u = zeros(Float64, nu)
     
     @variable(model, xmin[i] <= x[i in 1:nx, 1:N+1] <= xmax[i])
     @variable(model, umin[i] <= u[i in 1:nu, 1:N] <= umax[i])
@@ -37,7 +36,7 @@ function mpc_solver(name, problem, tol)
     J = @expression(
         model,
         sum(cost_func(x[:, k], u[:, k]) for k in 1:N) +
-        (x[:, N+1] - xr)' * QN * (x[:, N+1] - xr),
+        cost_func(x[:, N+1], zero_u),
     )
     @objective(model, Min, J)
     optimize!(model)
