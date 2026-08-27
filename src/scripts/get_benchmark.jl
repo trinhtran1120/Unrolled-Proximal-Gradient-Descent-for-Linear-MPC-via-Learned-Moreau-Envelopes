@@ -19,7 +19,7 @@ learned_pgm_gamma = 0.01
 learned_pgm_minimum_gamma = 1e-6
 learned_pgm_reduce_gamma = 0.5
 learned_pgm_increase_gamma = 1.05
-learned_moreau_gamma = 1.
+learned_moreau_gamma = 10.
 model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json")
 
 mpc_data = mpc_problem()

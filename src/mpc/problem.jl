@@ -109,7 +109,7 @@ function mpc_problem()
 
     nx = size(A, 1)
     nu = size(B, 2)
-    N = 20
+    N = 10
 
     cost_func = StageCost(Q, R, xr)
     A_ro, B_ro = convert_matrix(A, B, N)
