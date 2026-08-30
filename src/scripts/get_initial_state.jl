@@ -1,6 +1,6 @@
 # Generate feasible initial states for the linear MPC example.
 using LinearAlgebra
-using OSQP
+using OSQP, Clarabel
 using Printf
 using NPZ
 
@@ -23,7 +23,7 @@ end
 
 
 function main()
-    solver_name = "OSQP"
+    solver_name = "Clarabel"
     tol = 1e-6
     x1_grid = -5.0:0.1:5.0
     x2_grid = -5.0:0.1:5.0

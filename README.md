@@ -58,7 +58,8 @@ julia --project=. -e 'using Pkg; Pkg.test()'
 ## Generate Data
 
 The dataset script solves the linear MPC problem, runs exact PGM, and logs
-Moreau-envelope values, gradients, and adaptive step sizes for ICNN training.
+projection queries, initial states, and exact projection labels for neural
+projection training.
 
 ```bash
 julia --project=. src/scripts/get_data.jl
@@ -67,29 +68,28 @@ julia --project=. src/scripts/get_data.jl
 This writes files like:
 
 ```text
-data/PGM-rho=0.1_nx=2_N=10-train.npz
-data/PGM-rho=0.1_nx=2_N=10-test.npz
+data/PGM-mu=0.001_gamma=0.001_nx=2_N=10-train_adaptive.npz
+data/PGM-mu=0.001_gamma=0.001_nx=2_N=10-test_adaptive.npz
 ```
 
-## Train the ICNN
+## Train the Projection MLP
 
-Train and export the learned squared-distance model:
+Train and export the learned projection model:
 
 ```bash
-python src/learning/train_icnn.py
+python src/learning/train_nn.py
 ```
 
-The training script currently reads the `rho=0.1` datasets and writes:
+The training script currently reads the `mu=0.001, gamma=0.001` datasets and writes:
 
 ```text
-model/linear-mpc-icnn-rho=0.1-distance.pkl
-model/linear-mpc-icnn-rho=0.1-distance.json
+model/linear-mpc-projection-mlp_tanh.pkl
+model/linear-mpc-projection-mlp_tanh.json
 ```
 
-The pickle file uses the same `linear-mpc-icnn-rho=0.1-distance` stem. The ICNN
-learns half the squared distance to the MPC feasible set from `[y, x0]`.
-At runtime, the learned PGM divides its value and gradient by the current
-positive `gamma` to recover the corresponding Moreau envelope exactly.
+The projection MLP learns the map from `(U_query, x0)` to `V_star`. At runtime,
+the learned PGM forms the Moreau-envelope value and gradient from that learned
+projection and the positive Moreau coefficient.
 
 ## Run the Benchmark
 

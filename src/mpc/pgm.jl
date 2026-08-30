@@ -1,8 +1,9 @@
-"""Proximal Gradient Method for Linear MPC.
-minimize    f(U) + g(U)
+"""Three-operator splitting for Moreau-smoothed Linear MPC.
+minimize    f(U) + g(U) + h(U)
 where
-    f: differentiable stage cost / objective
-    g: indicator function of the feasible constraint set
+    f: condensed quadratic stage cost
+    g: indicator function of the input box
+    h: Moreau envelope of the state-feasible set indicator
 """
 
 using LinearAlgebra
@@ -11,9 +12,6 @@ using JuMP
 import MathOptInterface as MOI
 using ProximalAlgorithms
 using ProximalOperators
-using OSQP
-using JuMP
-import MathOptInterface as MOI
 
 include("problem.jl")
 include("../utils/preprocess.jl")
@@ -34,41 +32,21 @@ function rollout(problem::LinearMPC, x0::Vector{Float64}, U::Matrix{Float64})
     return X
 end
 
-function StateConstraint(name, problem, tol::Float64 = 1e-8)
-    solver_name = name isa Symbol ? String(name) : name
-    solver_tol = max(tol, eps(Float64))
-    model = pick_solver(solver_name, solver_tol)
-    A_ro = problem.A_ro
-    B_ro = problem.B_ro
-    xmin = problem.xmin
-    xmax = problem.xmax
-    nx = problem.nx
-    nu = problem.nu
-    N = problem.N
+StateConstraint(name::Symbol, problem, tol::Float64 = 1e-8) = StateConstraint(String(name), problem, tol)
 
-    @variable(model, x0[i in 1:nx] in MOI.Parameter(problem.x0[i]))
-    @variable(model, V[1:nu * N])
-    @variable(model, U_ref[i in 1:nu * N] in MOI.Parameter(0.0))
+function state_constraints(problem::LinearMPC, x0 = nothing)
+    Gx = [problem.B_ro; -problem.B_ro]
+    x0 === nothing && return Gx
 
-    X = A_ro * x0 + B_ro * V
-    @constraint(model, X .<= fill(xmax, nx * N))
-    @constraint(model, fill(xmin, nx * N) .<= X)
-    @objective(model, Min, 0.5 * sum((V[i] - U_ref[i])^2 for i in 1:nu * N))
+    x_free = problem.A_ro * x0
+    b_state = [
+        fill(problem.xmax, problem.nx * problem.N) - x_free;
+        -fill(problem.xmin, problem.nx * problem.N) + x_free
+    ]
 
-    function solver(init::Vector{Float64}, q::AbstractVector{Float64}; verbose = false)
-        set_parameter_value.(x0, init)
-        set_parameter_value.(U_ref, q)
-        optimize!(model)
-
-        if verbose
-            println(solution_summary(model))
-        end
-
-        return value.(V), objective_value(model)
-    end
-
-    return solver
+    return Gx, b_state
 end
+
 
 struct DifferentiableQuadratic
     H::Matrix{Float64}
@@ -142,7 +120,7 @@ struct MoreauEnvelope
     cost::DifferentiableQuadratic
     project::Function
     x0::Vector{Float64}
-    rho::Float64
+    mu::Float64
     data
 end
 
@@ -158,7 +136,7 @@ function ProximalAlgorithms.value_and_gradient(f::MoreauEnvelope, u)
     For a feasible input set C(x0), this evaluates the quadratic cost plus the
     Moreau envelope of the indicator function I_C:
 
-        M_rho I_C(u) = min_{v in C(x0)} (1 / 2) ||v - u||_2^2
+        M_mu I_C(u) = min_{v in C(x0)} (1 / 2) ||v - u||_2^2
 
     with projection
 
@@ -166,26 +144,40 @@ function ProximalAlgorithms.value_and_gradient(f::MoreauEnvelope, u)
 
     The returned value and gradient are
 
-        phi(u) = l(u) + (1 / rho) M_rho I_C(u)
-        grad phi(u) = grad l(u) + (1 / rho) (u - p),
+        phi(u) = l(u) + (1 / mu) M_mu I_C(u)
+        grad phi(u) = grad l(u) + (1 / mu) (u - p),
 
     where l(u) = f.cost(u).
     """
     cost_value, cost_grad = ProximalAlgorithms.value_and_gradient(f.cost, u)
     projected_u, distance_value = f.project(f.x0, u)
     distance_grad = u .- projected_u
-    value = cost_value + distance_value /f.rho
-    grad = cost_grad .+ distance_grad ./ f.rho
+    value = cost_value + distance_value / f.mu
+    grad = cost_grad .+ distance_grad ./ f.mu
 
     if f.data !== nothing
-        push!(f.data["input"], copy(u))
-        push!(f.data["parameter"], copy(f.x0))
-        push!(f.data["proj"], copy(projected_u))
-        push!(f.data["env"], distance_value)
-        push!(f.data["grad"], copy(distance_grad))
+        append_projection_sample!(
+            f.data,
+            f.x0,
+            u,
+            projected_u,
+        )
     end
 
     return value, grad
+end
+
+function append_projection_sample!(
+    data,
+    x0::AbstractVector,
+    U_query::AbstractVector,
+    V_star::AbstractVector,
+)
+    push!(get!(data, "x0", Vector{Float64}[]), copy(x0))
+    push!(get!(data, "U_query", Vector{Float64}[]), copy(U_query))
+    push!(get!(data, "V_star", Vector{Float64}[]), copy(V_star))
+
+    return nothing
 end
 
 ## objective computation
@@ -216,7 +208,6 @@ function StateConstraint(name::String, problem::LinearMPC, tol::Float64)
     @constraint(model, X .<= fill(xmax, nx* N))
     @constraint(model, fill(xmin, nx*N) .<= X)
     @objective(model, Min, 0.5*sum((V[i] - U_ref[i])^2 for i in 1:N*nu))
-    optimize!(model)
 
     function solver(init::Vector{Float64}, q::AbstractVector{Float64}; verbose=false)
         set_parameter_value.(x0, init)
@@ -228,73 +219,176 @@ function StateConstraint(name::String, problem::LinearMPC, tol::Float64)
             println(solution_summary(model))
         end
 
-        return value.(V), objective_value(model)
+        V_star = value.(V)
+        distance_value = objective_value(model)
+
+        return V_star, distance_value
     end
     return solver
 end
 
 
-## PGM 
+## Three-operator splitting
+function tos_step!(
+    X_iter::Vector{Float64},
+    Y::Vector{Float64},
+    residual_vector::Vector{Float64},
+    cost::DifferentiableQuadratic,
+    project,
+    x0::Vector{Float64},
+    Z::Vector{Float64},
+    lower_U::Vector{Float64},
+    upper_U::Vector{Float64},
+    mu::Float64,
+    gamma::Float64,
+)
+    X_iter .= clamp.(Z, lower_U, upper_U)
+    V_star, distance_value = project(x0, X_iter)
+
+    D = (X_iter .- V_star) ./ mu
+    R = 2.0 .* X_iter .- Z .- gamma .* D
+    cost_factor = cholesky(Symmetric(Matrix{Float64}(I, length(Z), length(Z)) + gamma * cost.H))
+    Y .= cost_factor \ (R .- gamma .* cost.h)
+    residual_vector .= Y .- X_iter
+
+    return V_star, distance_value
+end
+
+function backtracking_step!(
+    mu::Float64,
+    gamma::Float64,
+    X_iter::Vector{Float64},
+    Y::Vector{Float64},
+    residual_vector::Vector{Float64},
+    cost::DifferentiableQuadratic,
+    project,
+    x0::Vector{Float64},
+    Z::Vector{Float64},
+    lower_U::Vector{Float64},
+    upper_U::Vector{Float64},
+    ;
+    minimum_gamma::Float64 = 1e-6,
+    reduce_gamma::Float64 = 0.5,
+)
+    candidate_gamma = gamma
+    backtracks = 0
+
+    while true
+        V_star, distance_x = tos_step!(
+            X_iter,
+            Y,
+            residual_vector,
+            cost,
+            project,
+            x0,
+            Z,
+            lower_U,
+            upper_U,
+            mu,
+            candidate_gamma,
+        )
+        _V_y, distance_y = project(x0, Y)
+
+        h_x = distance_x / mu
+        h_y = distance_y / mu
+        linear_model = (dot(residual_vector, X_iter) - dot(residual_vector, V_star)) / mu
+        quadratic_model = dot(residual_vector, residual_vector) / (2.0 * candidate_gamma)
+        line_search_margin = 1e-12 * max(1.0, abs(h_x), abs(h_y))
+
+        if h_y <= h_x + linear_model + quadratic_model + line_search_margin || candidate_gamma <= minimum_gamma
+            residual = norm(residual_vector) / max(1.0, norm(X_iter))
+            return candidate_gamma, residual, V_star, backtracks
+        end
+
+        candidate_gamma = max(minimum_gamma, candidate_gamma * reduce_gamma)
+        backtracks += 1
+    end
+end
+
 function PGM_solver(
     problem::LinearMPC;
-    rho::Float64 = 0.1,
+    mu::Float64 = 0.1,
     gamma::Float64 = 0.1,
+    relaxation::Float64 = 1.0,
     adaptive::Bool=true,
     minimum_gamma::Float64=1e-6,
     reduce_gamma::Float64=0.5,
-    increase_gamma::Float64=1.05,
+    increase_gamma::Float64=1.0,
     max_iter::Int=1000,
     tol::Float64=1e-3
 )
+    mu > 0.0 || throw(ArgumentError("mu must be positive"))
+    gamma > 0.0 || throw(ArgumentError("gamma must be positive"))
+    relaxation > 0.0 || throw(ArgumentError("relaxation must be positive"))
+
     nu = problem.nu
     N = problem.N
-    u0 = zeros(Float64, nu * N)
-    u_solution = copy(u0)
-    input_constraint = ProximalOperators.IndBox(
-        fill(problem.umin, nu * N),
-        fill(problem.umax, nu * N),
-    )
+    nU = nu * N
+    Z0 = zeros(Float64, nU)
+    lower_U = fill(problem.umin, nU)
+    upper_U = fill(problem.umax, nU)
     project = StateConstraint("OSQP", problem, 1e-6)
 
     return @inbounds function solver(x0::Vector{Float64}; data = nothing, verbose = false)
-        cost = single_shooting_cost(problem, x0)
-        f = MoreauEnvelope(cost, project, x0, rho, data)
+        cost, constant_cost = cost_cache(problem, x0)
+        current_gamma = gamma
 
-        ffb_iter = ProximalAlgorithms.FastForwardBackwardIteration(
-            f = f,
-            g = input_constraint,
-            x0 = u0,
-            gamma = adaptive ? nothing : gamma,
-            adaptive = adaptive,
-            minimum_gamma = minimum_gamma,
-            reduce_gamma = reduce_gamma,
-            increase_gamma = increase_gamma,
-        )
+        Z = copy(Z0)
+        X_iter = similar(Z)
+        Y = similar(Z)
+        residual_vector = similar(Z)
+        residual = Inf
+        converged = false
+        iter_done = 0
 
-        for (iter, state) in enumerate(ffb_iter)
-            u_solution .= state.z
-            residual = norm(state.res, Inf) / state.gamma
-            
+        for iter in 1:max_iter
+            if adaptive
+                current_gamma *= increase_gamma
+                current_gamma, residual, V_star, _backtracks = backtracking_step!(
+                    mu,
+                    current_gamma,
+                    X_iter,
+                    Y,
+                    residual_vector,
+                    cost,
+                    project,
+                    x0,
+                    Z,
+                    lower_U,
+                    upper_U,
+                    minimum_gamma = minimum_gamma,
+                    reduce_gamma = reduce_gamma,
+                )
+            else
+                V_star, _distance_x = tos_step!(X_iter, Y, residual_vector, cost, project, x0, Z, lower_U, upper_U, mu, current_gamma)
+                residual = norm(residual_vector) / max(1.0, norm(X_iter))
+            end
+
             if data !== nothing
-                haskey(data, "gamma") && push!(data["gamma"], state.gamma)
+                append_projection_sample!(data, x0, X_iter, V_star)
             end
 
             if residual <= tol
+                converged = true
+                iter_done = iter
                 if verbose
-                    println("Converged at iteration $iter")
+                    println("TOS converged at iteration $iter")
                 end
                 break
             end
 
-            if iter >= max_iter
-                break
-            end
+            Z .+= relaxation .* residual_vector
+            iter_done = iter
         end
 
-        U = reshape(u_solution, nu, N)
+        U = reshape(copy(X_iter), nu, N)
         X = rollout(problem, x0, U)
-        final_f = MoreauEnvelope(cost, project, x0, rho, nothing)
-        objective = final_f(u_solution)
+        _V_final, distance_final = project(x0, vec(U))
+        objective = constant_cost + cost(vec(U)) + distance_final / mu
+
+        if verbose && !converged
+            println("TOS stopped after $iter_done iterations with residual $residual")
+        end
 
         return U, X, objective
     end

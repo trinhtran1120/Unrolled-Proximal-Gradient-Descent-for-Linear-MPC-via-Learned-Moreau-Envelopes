@@ -21,21 +21,29 @@ solver_name = "Ipopt"
 feasibility_solver_name = "OSQP"
 const solver_tol = 1e-6
 
-#PGM algorithm settings
-const pgm_tol = 1e-2
-const pgm_rho = 0.1
-const pgm_gamma = 0.001
+# PGM algorithm settings
+const pgm_tol = 1e-3
+const pgm_mu = 1.0
+const pgm_gamma = 0.1
+const pgm_relaxation = 1.0
 const pgm_adaptive = true
+const pgm_increase_gamma = 1.05
 const pgm_max_iter = 1000
-
-# Tolerances for down-sampling near-zero Moreau envelopes and gradients
-const near_zero_env_tol = 1e-12
-const near_zero_grad_tol = 1e-10
-const zero_to_nonzero_ratio = 0.1
 
 function stack_samples(data, key)
     isempty(data[key]) && error("No samples collected for `$key`; check the feasible initial-state pool and PGM settings.")
     return reduce(hcat, data[key])
+end
+
+function dataset_payload(data, mpc_data)
+    return Dict{String,Any}(
+        "x0" => stack_samples(data, "x0"),
+        "U_query" => stack_samples(data, "U_query"),
+        "V_star" => stack_samples(data, "V_star"),
+        "N" => mpc_data.N,
+        "nx" => mpc_data.nx,
+        "nu" => mpc_data.nu,
+    )
 end
 
 function main()
@@ -45,21 +53,23 @@ function main()
     solve_mpc = mpc_solver(solver_name, mpc_data, solver_tol)
     solve_pgm = PGM_solver(
         mpc_data;
-        rho = pgm_rho,
+        mu = pgm_mu,
         gamma = pgm_gamma,
+        relaxation = pgm_relaxation,
         adaptive = pgm_adaptive,
+        increase_gamma = pgm_increase_gamma,
         max_iter = pgm_max_iter,
         tol = pgm_tol,
     )
     cost_func = mpc_data.cost_func
 
-    data_train = Dict("input" => Vector{Float64}[], "parameter" => Vector{Float64}[], "proj" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
-    data_test = Dict("input" => Vector{Float64}[], "parameter" => Vector{Float64}[], "proj" => Vector{Float64}[], "env" => Float64[], "grad" => Vector{Float64}[])
+    data_train = Dict{String,Any}()
+    data_test = Dict{String,Any}()
 
     is_feasible = initialization(feasibility_solver_name, mpc_data, solver_tol)
 
-    x1_grid = -2.0:0.5:3.0
-    x2_grid = -2.0:0.5:4.0
+    x1_grid = -3.0:0.5:3.0
+    x2_grid = -3.0:0.5:4.0
     initial_pool = [
         [Float64(x1), Float64(x2)]
         for x1 in x1_grid
@@ -82,7 +92,7 @@ function main()
         @printf("J_opt = %8.4f\n", J_opt)
 
         println("---------------- PGM ----------------")
-        pgm_U, pgm_X, _ = solve_pgm(x0; data = data_train, verbose = true)
+        pgm_U, pgm_X, J_pgm_smooth = solve_pgm(x0; data = data_train, verbose = true)
         J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
         delta_J = abs(J_opt - J_PGM)
 
@@ -93,52 +103,31 @@ function main()
         end
 
         @printf("J_PGM = %8.4f\n", J_PGM)
+        @printf("J_PGM_smooth = %8.4f\n", J_pgm_smooth)
         @printf("Delta J = %8.4e\n", delta_J)
         @printf("Delta J/J = %8.4f%%\n", optimality_gap)
         @printf("max|opt_U - PGM_U| = %8.4f\n\n", maximum(abs.(opt_U - pgm_U)))
     end
 
-    train_data = Dict{String,Any}(
-        "input" => stack_samples(data_train, "input"),
-        "parameter" => stack_samples(data_train, "parameter"),
-        "proj" => stack_samples(data_train, "proj"),
-        "grad" => stack_samples(data_train, "grad"),
-        "adaptive" => pgm_adaptive,
-        "env" => data_train["env"],
-        "N" => mpc_data.N,
-        "nx" => mpc_data.nx,
-        "nu" => mpc_data.nu,
-        "rho_initial" => pgm_rho,
-        "gamma_initial" => pgm_gamma,
-    )
+    @printf("Collected %4d training data points\n\n", length(data_train["U_query"]))
+    train_data = dataset_payload(data_train, mpc_data)
     npzwrite(
-        joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
+        joinpath(DATASET_DIR, "PGM-mu=$(pgm_mu)_gamma=$(pgm_gamma)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-train_$(mode_tag).npz"),
         train_data,
     )
 
     for x0 in test_pool
         println("================ Collecting testing data with initial state = $x0 ================")
-        pgm_U, pgm_X, _ = solve_pgm(x0; data = data_test, verbose = true)
+        pgm_U, pgm_X, J_pgm_smooth = solve_pgm(x0; data = data_test, verbose = true)
         J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
         @printf("J_PGM = %8.4f\n", J_PGM)
+        @printf("J_PGM_smooth = %8.4f\n", J_pgm_smooth)
     end
 
-    @printf("Collected %4d testing data points\n\n", length(data_test["input"]))
-    test_data = Dict{String,Any}(
-        "input" => stack_samples(data_test, "input"),
-        "parameter" => stack_samples(data_test, "parameter"),
-        "proj" => stack_samples(data_test, "proj"),
-        "grad" => stack_samples(data_test, "grad"),
-        "adaptive" => pgm_adaptive,
-        "env" => data_test["env"],
-        "N" => mpc_data.N,
-        "nx" => mpc_data.nx,
-        "nu" => mpc_data.nu,
-        "rho_initial" => pgm_rho,
-        "gamma_initial" => pgm_gamma,
-    )
+    @printf("Collected %4d testing data points\n\n", length(data_test["U_query"]))
+    test_data = dataset_payload(data_test, mpc_data)
     npzwrite(
-        joinpath(DATASET_DIR, "PGM-rho=$(pgm_rho)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
+        joinpath(DATASET_DIR, "PGM-mu=$(pgm_mu)_gamma=$(pgm_gamma)_nx=$(mpc_data.nx)_N=$(mpc_data.N)-test_$(mode_tag).npz"),
         test_data,
     )
 end

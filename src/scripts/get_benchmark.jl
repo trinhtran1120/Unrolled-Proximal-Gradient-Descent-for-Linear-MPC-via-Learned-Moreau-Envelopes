@@ -3,7 +3,7 @@ using LinearAlgebra
 using Printf
 using Statistics
 
-using OSQP, Ipopt
+using OSQP, Ipopt, Clarabel
 include(joinpath(@__DIR__, "..", "mpc", "learned_pgm.jl"))
 include(joinpath(@__DIR__, "..", "mpc", "solver.jl"))
 
@@ -13,36 +13,44 @@ tol = 1e-3
 pgm_max_iter = 1000
 learned_pgm_max_iter = 1000
 benchmark_samples = 10
-exact_pgm_rho = 0.1
-exact_pgm_gamma = 0.1
+exact_pgm_mu = 1.0
+exact_pgm_gamma = 1.0
 exact_pgm_adaptive = true
-learned_pgm_gamma = 0.01
+exact_pgm_increase_gamma = 1.0
+learned_pgm_gamma = 1.0
 learned_pgm_minimum_gamma = 1e-6
 learned_pgm_reduce_gamma = 0.5
-learned_pgm_increase_gamma = 1.05
+learned_pgm_increase_gamma = 1.0
+learned_pgm_relaxation = 1.0
 model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json")
 
 mpc_data = mpc_problem()
 x0 = [1.4, 2.6]
-n_batch = 32
-println(n_batch)
 BLAS.set_num_threads(12)
 
 solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
-solve_pgm = PGM_solver(mpc_data; gamma = exact_pgm_gamma, adaptive = exact_pgm_adaptive, max_iter = pgm_max_iter, tol = 1e-2)
+solve_pgm = PGM_solver(
+    mpc_data;
+    mu = exact_pgm_mu,
+    gamma = exact_pgm_gamma,
+    adaptive = exact_pgm_adaptive,
+    increase_gamma = exact_pgm_increase_gamma,
+    max_iter = pgm_max_iter,
+    tol = 1e-2,
+)
 
 learned_model = load_projection_mlp(model_path)
 solve_learned = learned_PGM(
     learned_model,
     mpc_data;
+    mu = learned_model.mu,
     gamma = learned_pgm_gamma,
+    relaxation = learned_pgm_relaxation,
     minimum_gamma = learned_pgm_minimum_gamma,
     reduce_gamma = learned_pgm_reduce_gamma,
     increase_gamma = learned_pgm_increase_gamma,
     max_iter = learned_pgm_max_iter,
-    gradient_batch_size = n_batch,
-    tol = 0.1,
-    accelerated = true,
+    tol = 0.01,
 )
 
 function max_constraint_violation(problem, U, X)
@@ -67,16 +75,17 @@ println("================ Open-loop linear MPC benchmark ================")
 println("initial state = $x0")
 println("horizon N = $(mpc_data.N)")
 println("solver = $solver_name")
-println("exact PGM rho = $exact_pgm_rho")
-println("exact PGM gamma = $exact_pgm_gamma")
-println("exact PGM mode = $(exact_pgm_adaptive ? "adaptive" : "fixed")")
-println("learned projection-MLP rho = $(learned_model.rho)")
-println("learned projection-MLP PGM initial gamma = $learned_pgm_gamma")
-println("learned projection-MLP PGM minimum gamma = $learned_pgm_minimum_gamma")
-println("learned projection-MLP PGM reduce gamma = $learned_pgm_reduce_gamma")
-println("learned projection-MLP PGM increase gamma = $learned_pgm_increase_gamma")
-println("learned projection-MLP PGM depth = $learned_pgm_max_iter")
-println("learned gradient batch size = $n_batch")
+println("exact TOS Moreau mu = $exact_pgm_mu")
+println("exact TOS initial splitting gamma = $exact_pgm_gamma")
+println("exact TOS mode = $(exact_pgm_adaptive ? "adaptive" : "fixed")")
+println("exact TOS gamma increase factor = $exact_pgm_increase_gamma")
+println("Learned TOS Moreau mu = $(learned_model.mu)")
+println("Learned TOS initial gamma = $learned_pgm_gamma")
+println("Learned TOS minimum gamma = $learned_pgm_minimum_gamma")
+println("Learned TOS reduce gamma = $learned_pgm_reduce_gamma")
+println("Learned TOS increase gamma = $learned_pgm_increase_gamma")
+println("Learned TOS relaxation = $learned_pgm_relaxation")
+println("Learned TOS depth = $learned_pgm_max_iter")
 println("active Julia threads = $(Threads.nthreads())")
 println("BLAS threads = $(BLAS.get_num_threads())")
 println("learned model = $model_path")
@@ -90,7 +99,7 @@ opt_X, opt_U, solver_time, J_opt = solve_mpc(x0; verbose = false)
 @printf("objective = %10.6f\n", J_opt)
 @printf("solve time = %8.3f ms\n\n", solver_time * 1000)
 
-println("---------------- exact PGM ----------------")
+println("---------------- exact TOS ----------------")
 pgm_time = @elapsed pgm_U, pgm_X, _ = solve_pgm(x0; verbose = true)
 J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
 @printf("objective = %10.6f\n", J_pgm)
@@ -100,7 +109,7 @@ J_pgm, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
 @printf("max |solver U - PGM U| = %8.4e\n", maximum(abs.(opt_U - pgm_U)))
 @printf("max |solver X - PGM X| = %8.4e\n\n", maximum(abs.(opt_X - pgm_X)))
 
-println("---------------- learned projection-MLP PGM ----------------")
+println("---------------- Learned TOS ----------------")
 learned_sol = solve_learned(x0; verbose = true)
 J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 @printf("objective = %10.6f\n", J_learned)
@@ -125,5 +134,5 @@ J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 # end
 
 # @printf("%s mean time = %8.3f ms\n", solver_name, mean(solver_times[2:end]) * 1000)
-# @printf("exact PGM mean time = %8.3f ms\n", mean(pgm_times[2:end]) * 1000)
-# @printf("learned projection-MLP PGM mean time = %8.3f ms\n", mean(learned_pgm_times[2:end]) * 1000)
+# @printf("exact TOS mean time = %8.3f ms\n", mean(pgm_times[2:end]) * 1000)
+# @printf("Learned TOS mean time = %8.3f ms\n", mean(learned_pgm_times[2:end]) * 1000)

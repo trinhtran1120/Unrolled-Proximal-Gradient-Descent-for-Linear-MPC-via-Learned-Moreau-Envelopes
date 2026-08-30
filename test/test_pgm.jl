@@ -31,8 +31,16 @@ end
     X_trial = rollout(problem, problem.x0, U_trial)
     @test f(vec(U_trial)) + zero_input_cost ≈ trajectory_cost(problem, X_trial, U_trial)
 
+    projection_data = Dict{String,Any}()
+    U_query = [1.0, 2.0]
+    V_star = [0.5, 3.0]
+    append_projection_sample!(projection_data, problem.x0, U_query, V_star)
+    @test projection_data["U_query"][1] == U_query
+    @test projection_data["x0"][1] == problem.x0
+    @test projection_data["V_star"][1] == V_star
+    @test keys(projection_data) == Set(["U_query", "x0", "V_star"])
 
-    solve_pgm = PGM_solver(problem; rho=0.001, gamma=0.1, adaptive=true, max_iter=1000, tol=1e-2)
+    solve_pgm = PGM_solver(problem; gamma=0.1, adaptive=true, max_iter=1000, tol=1e-2)
     U_pgm, X_pgm, J_pgm = solve_pgm(problem.x0)
 
     @test size(U_pgm) == (problem.nu, problem.N)

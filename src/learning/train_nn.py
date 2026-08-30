@@ -18,12 +18,12 @@ root = Path(__file__).resolve().parents[2]
 data_dir = root / "data"
 model_dir = root / "model"
 
-train_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-train_adaptive.npz"
-test_data_path = data_dir / "PGM-rho=0.1_nx=2_N=10-test_adaptive.npz"
+train_data_path = data_dir / "PGM-mu=1.0_gamma=0.1_nx=2_N=10-train_adaptive.npz"
+test_data_path = data_dir / "PGM-mu=1.0_gamma=0.1_nx=2_N=10-test_adaptive.npz"
 model_path = model_dir / "linear-mpc-projection-mlp_tanh"
 
 
-hidden_widths = (64, 64)
+hidden_widths = (16, 16)
 activation = "tanh"
 learning_rate = 1e-3
 lr_decay_rate = 0.98
@@ -36,6 +36,7 @@ epochs = 5000
 eval_interval = 1000
 seed = 0
 dtype = jnp.float64
+model_mu = 1.0
 
 
 def load_data(path: Path):
@@ -44,16 +45,9 @@ def load_data(path: Path):
         nu = int(data["nu"])
         horizon = int(data["N"])
 
-        raw_input = np.asarray(data["input"], dtype=float).T
-        if "parameter" in data and "proj" in data:
-            model_input = raw_input
-            parameter = np.asarray(data["parameter"], dtype=float).T
-            projection = np.asarray(data["proj"], dtype=float).T
-        else:
-            input_dim = nu * horizon
-            model_input = raw_input[:, :input_dim]
-            parameter = raw_input[:, input_dim : input_dim + nx]
-            projection = model_input - np.asarray(data["grad"], dtype=float).T
+        model_input = np.asarray(data["U_query"], dtype=float).T
+        parameter = np.asarray(data["x0"], dtype=float).T
+        projection = np.asarray(data["V_star"], dtype=float).T
 
         if model_input.shape != projection.shape:
             raise ValueError(f"{path}: input and projection shapes differ: {model_input.shape} vs {projection.shape}")
@@ -140,6 +134,7 @@ def main():
         **params,
         "model_type": "projection_mlp",
         "target": "state_projection",
+        "mu": model_mu,
         "mpc": {
             "nx": train_meta["nx"],
             "nu": train_meta["nu"],

@@ -16,7 +16,7 @@ struct ProjectionMLP
     E::Matrix{Float64}
     E_pinv::Matrix{Float64}
     activation::String
-    rho::Float64
+    mu::Float64
 end
 
 gelu(x) = 0.5 * x * (1 + erf(x / sqrt(2)))
@@ -55,7 +55,7 @@ function load_projection_mlp(path::AbstractString)
     b_theta = json_matrix(hasproperty(feasibility, :b_theta) ? feasibility.b_theta : feasibility.b_para)
     E = hasproperty(feasibility, :E) ? json_matrix(feasibility.E) : hcat(Gx, Matrix{Float64}(I, size(Gx, 1), size(Gx, 1)))
     E_pinv = hasproperty(feasibility, :E_pinv) ? json_matrix(feasibility.E_pinv) : ((E * E') \ E)'
-    rho = Float64(json_field(data, :rho_initial, json_field(data, :rho, json_field(data, :gamma, 1.0))))
+    mu = Float64(json_field(data, :mu, json_field(data, :gamma, 1.0)))
     activation = String(json_field(data, :activation, "gelu"))
 
     return ProjectionMLP(
@@ -71,7 +71,7 @@ function load_projection_mlp(path::AbstractString)
         E,
         E_pinv,
         activation,
-        rho,
+        mu,
     )
 end
 
@@ -87,7 +87,7 @@ function projection_mlp_forward(model::ProjectionMLP, input::AbstractVector, par
     return z_hat[1:model.input_dim], z_hat[model.input_dim + 1:end]
 end
 
-function projection_mlp_gradient(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
+function projection_mlp_gradient(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector; mu::Float64 = model.mu)
     V_tilde, _ = projection_mlp_forward(model, input, parameter)
-    return (input .- V_tilde) ./ model.rho
+    return (input .- V_tilde) ./ mu
 end
