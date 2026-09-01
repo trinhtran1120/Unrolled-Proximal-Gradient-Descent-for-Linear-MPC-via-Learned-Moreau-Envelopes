@@ -20,9 +20,10 @@ function mpc_solver(name, problem, tol)
     nu = problem.nu
     N = problem.N
     cost_func = problem.cost_func
+    zero_u = zeros(Float64, nu)
     
-    @variable(model, xmin .<= x[1:nx, 1:N+1] .<= xmax)
-    @variable(model, umin .<= u[1:nu, 1:N] .<= umax)
+    @variable(model, xmin[i] <= x[i in 1:nx, 1:N+1] <= xmax[i])
+    @variable(model, umin[i] <= u[i in 1:nu, 1:N] <= umax[i])
 
     @variable(model, x0[i in 1:nx] in MOI.Parameter(x0_init[i]))
 
@@ -32,7 +33,11 @@ function mpc_solver(name, problem, tol)
         @constraint(model, x[:, k+1] .== A * x[:, k] + B * u[:, k])
     end
 
-    J = @expression(model, sum(cost_func(x[:,k], u[:, k]) for k in 1:N))
+    J = @expression(
+        model,
+        sum(cost_func(x[:, k], u[:, k]) for k in 1:N) +
+        cost_func(x[:, N+1], zero_u),
+    )
     @objective(model, Min, J)
     optimize!(model)
 
@@ -61,8 +66,8 @@ function initialization(name, problem, tol)
     model = pick_solver(name, tol)
     nx, nu, N = problem.nx, problem.nu, problem.N
 
-    @variable(model, problem.xmin <= x[1:nx, 1:N+1] <= problem.xmax)
-    @variable(model, problem.umin <= u[1:nu, 1:N] <= problem.umax)
+    @variable(model, problem.xmin[i] <= x[i in 1:nx, 1:N+1] <= problem.xmax[i])
+    @variable(model, problem.umin[i] <= u[i in 1:nu, 1:N] <= problem.umax[i])
     @variable(model, x0[i in 1:nx] in MOI.Parameter(problem.x0[i]))
 
     @constraint(model, x[:, 1] .== x0)

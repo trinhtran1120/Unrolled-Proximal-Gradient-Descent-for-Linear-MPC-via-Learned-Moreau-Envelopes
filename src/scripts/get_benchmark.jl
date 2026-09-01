@@ -25,7 +25,8 @@ learned_pgm_relaxation = 1.0
 model_path = joinpath(@__DIR__, "..", "..", "model", "linear-mpc-projection-mlp_tanh.json")
 
 mpc_data = mpc_problem()
-x0 = [1.4, 2.6]
+x0 = copy(mpc_data.x0)
+x0[1:2] .= [0.1, 0.2]
 BLAS.set_num_threads(12)
 
 solve_mpc = mpc_solver(solver_name, mpc_data, 1e-6)
@@ -36,7 +37,7 @@ solve_pgm = PGM_solver(
     adaptive = exact_pgm_adaptive,
     increase_gamma = exact_pgm_increase_gamma,
     max_iter = pgm_max_iter,
-    tol = 1e-2,
+    tol = 1e-3,
 )
 
 learned_model = load_projection_mlp(model_path)
@@ -50,7 +51,7 @@ solve_learned = learned_PGM(
     reduce_gamma = learned_pgm_reduce_gamma,
     increase_gamma = learned_pgm_increase_gamma,
     max_iter = learned_pgm_max_iter,
-    tol = 0.01,
+    tol = 0.003,
 )
 
 function max_constraint_violation(problem, U, X)
@@ -117,7 +118,8 @@ J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 @printf("relative objective gap = %8.4f%%\n", relative_objective_gap(J_opt, J_learned))
 @printf("max constraint violation = %8.4e\n", max_constraint_violation(mpc_data, learned_sol.U, learned_sol.X))
 @printf("max |solver U - learned PGM U| = %8.4e\n", maximum(abs.(opt_U - learned_sol.U)))
-@printf("max |solver X - learned PGM X| = %8.4e\n\n", maximum(abs.(opt_X - learned_sol.X)))
+@printf("max |solver X - learned PGM X| = %8.4e\n", maximum(abs.(opt_X - learned_sol.X)))
+@printf("learned TOS backtracks = %d\n\n", sum(learned_sol.backtrack_history))
 
 # println("---------------- repeated timing ----------------")
 # solver_times = zeros(Float64, benchmark_samples)

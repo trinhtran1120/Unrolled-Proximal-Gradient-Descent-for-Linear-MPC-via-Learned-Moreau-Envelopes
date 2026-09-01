@@ -3,7 +3,7 @@ using JuMP
 import MathOptInterface as MOI
 using LinearAlgebra
 using NPZ
-using OSQP, Ipopt, MosekTools
+using OSQP, Ipopt, MosekTools, Clarabel
 using Printf
 
 include(joinpath(@__DIR__, "..", "mpc", "problem.jl"))
@@ -17,18 +17,18 @@ const DATASET_DIR = joinpath(@__DIR__, "..", "..", "data")
 mkpath(DATASET_DIR)
 
 #solver settings
-solver_name = "Ipopt"
+solver_name = "Clarabel"
 feasibility_solver_name = "OSQP"
 const solver_tol = 1e-6
 
 # PGM algorithm settings
 const pgm_tol = 1e-3
 const pgm_mu = 1.0
-const pgm_gamma = 0.1
-const pgm_relaxation = 1.0
+const pgm_gamma = 1.
+const pgm_relaxation = 1.5
 const pgm_adaptive = true
-const pgm_increase_gamma = 1.05
-const pgm_max_iter = 1000
+const pgm_increase_gamma = 1.0
+const pgm_max_iter = 3000
 
 function stack_samples(data, key)
     isempty(data[key]) && error("No samples collected for `$key`; check the feasible initial-state pool and PGM settings.")
@@ -46,6 +46,33 @@ function dataset_payload(data, mpc_data)
     )
 end
 
+function initial_state_with_offsets(problem::LinearMPC, offsets::Pair{Int,Float64}...)
+    init = copy(problem.x0)
+    for (idx, value) in offsets
+        init[idx] = value
+    end
+    return init
+end
+
+function candidate_initial_states(problem::LinearMPC)
+    offset_groups = [
+        [Pair{Int,Float64}[], [1 => 0.10]],
+        [Pair{Int,Float64}[], [2 => -0.10]],
+        [Pair{Int,Float64}[], [3 => 0.80], [3 => 1.20]],
+        [Pair{Int,Float64}[], [7 => 0.20, 8 => -0.20]],
+        [Pair{Int,Float64}[], [9 => 0.20]],
+        [Pair{Int,Float64}[], [10 => 0.10, 11 => -0.10, 12 => 0.10]],
+    ]
+
+    states = Vector{Vector{Float64}}()
+    for choices in Iterators.product(offset_groups...)
+        offsets = reduce(vcat, choices; init = Pair{Int,Float64}[])
+        push!(states, initial_state_with_offsets(problem, offsets...))
+    end
+
+    return states
+end
+
 function main()
     mode_tag = pgm_adaptive ? "adaptive" : "fixed"
 
@@ -61,21 +88,12 @@ function main()
         max_iter = pgm_max_iter,
         tol = pgm_tol,
     )
-    cost_func = mpc_data.cost_func
-
     data_train = Dict{String,Any}()
     data_test = Dict{String,Any}()
 
     is_feasible = initialization(feasibility_solver_name, mpc_data, solver_tol)
 
-    x1_grid = -3.0:0.5:3.0
-    x2_grid = -3.0:0.5:4.0
-    initial_pool = [
-        [Float64(x1), Float64(x2)]
-        for x1 in x1_grid
-        for x2 in x2_grid
-        if !isapprox([x1, x2], [0.0, 0.0]; atol = 1e-12) && is_feasible([Float64(x1), Float64(x2)])
-    ]
+    initial_pool = [x0 for x0 in candidate_initial_states(mpc_data) if is_feasible(x0)]
     split_idx = round(Int, 0.8 * length(initial_pool))
     isempty(initial_pool) && error("No feasible initial states found; try a different feasibility solver or a wider grid.")
 
@@ -93,7 +111,7 @@ function main()
 
         println("---------------- PGM ----------------")
         pgm_U, pgm_X, J_pgm_smooth = solve_pgm(x0; data = data_train, verbose = true)
-        J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
+        J_PGM, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
         delta_J = abs(J_opt - J_PGM)
 
         optimality_gap = if abs(J_opt) <= eps(Float64)
@@ -119,7 +137,7 @@ function main()
     for x0 in test_pool
         println("================ Collecting testing data with initial state = $x0 ================")
         pgm_U, pgm_X, J_pgm_smooth = solve_pgm(x0; data = data_test, verbose = true)
-        J_PGM = sum(cost_func(pgm_X[:, k], pgm_U[:, k]) for k in 1:mpc_data.N)
+        J_PGM, _ = evaluate_cost_gradient(mpc_data, x0, pgm_U)
         @printf("J_PGM = %8.4f\n", J_PGM)
         @printf("J_PGM_smooth = %8.4f\n", J_pgm_smooth)
     end

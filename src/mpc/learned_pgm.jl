@@ -97,6 +97,7 @@ function backtrack_stepsize!(
     reduce_gamma::Float64 = 0.5,
 )
     candidate_gamma = gamma
+    backtracks = 0
 
     while true
         V_tilde_x = learned_tos_step!(
@@ -123,10 +124,11 @@ function backtrack_stepsize!(
 
         if h_y <= h_x + linear_model + quadratic_model + line_search_margin || candidate_gamma <= minimum_gamma
             residual = norm(residual_vector) / max(1.0, norm(X_iter))
-            return candidate_gamma, residual, V_tilde_x, h_x
+            return candidate_gamma, residual, V_tilde_x, h_x, backtracks
         end
 
         candidate_gamma = max(minimum_gamma, candidate_gamma * reduce_gamma)
+        backtracks += 1
     end
 end
 
@@ -147,8 +149,8 @@ function learned_PGM(
     N = system.N
     nU = nu * N
     Z0 = zeros(Float64, nU)
-    lower_U = fill(system.umin, nU)
-    upper_U = fill(system.umax, nU)
+    lower_U = repeat_horizon(system.umin, N)
+    upper_U = repeat_horizon(system.umax, N)
 
     return @inbounds function solver(x0::Vector{Float64}; verbose = false)
         cost, constant_cost = cost_cache(system, x0)
@@ -163,12 +165,13 @@ function learned_PGM(
         objective_history = Float64[]
         residual_history = Float64[]
         gamma_history = Float64[]
+        backtrack_history = Int[]
 
         start_time = time()
         for iter in 1:max_iter
             current_gamma *= increase_gamma
 
-            current_gamma, residual, _V_tilde, h_x = backtrack_stepsize!(
+            current_gamma, residual, _V_tilde, h_x, backtracks = backtrack_stepsize!(
                 mu,
                 current_gamma,
                 X_iter,
@@ -187,6 +190,7 @@ function learned_PGM(
             push!(objective_history, constant_cost + cost(X_iter) + h_x)
             push!(gamma_history, current_gamma)
             push!(residual_history, residual)
+            push!(backtrack_history, backtracks)
 
             if residual <= tol
                 if verbose
@@ -210,6 +214,7 @@ function learned_PGM(
             objective_history = objective_history,
             residual_history = residual_history,
             gamma_history = gamma_history,
+            backtrack_history = backtrack_history,
             gamma = current_gamma,
             wall_time = wall_time,
             solve_time = solve_time,

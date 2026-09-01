@@ -20,13 +20,13 @@ x0 = problem.x0
 solver_name = "OSQP"
 tol = 1e-6
 mu = 1.
-gamma = 0.01
-relaxation = 1.0
+gamma = 1.
+relaxation = 1.5
 line_search = true
 minimum_gamma = 1e-6
 reduce_gamma = 0.5
 increase_gamma = 1.0
-max_iter = 1000
+max_iter = 2000
 pgm_tol = 1e-4
 
 solve_mpc = mpc_solver(solver_name, problem, tol)
@@ -52,17 +52,17 @@ opt_X, opt_U, opt_time, J_opt = solve_mpc(x0; verbose = false)
 @printf("max constraint violation = %8.4e\n\n", max_constraint_violation(problem, opt_U, opt_X))
 
 println("---------------- exact TOS PGM ----------------")
-@printf("Moreau mu = %.4e\n", mu)
-@printf("initial splitting gamma = %.4e\n", gamma)
-@printf("relaxation = %.4e\n", relaxation)
-@printf("Line search = %s\n", line_search ? "on" : "off")
-if line_search
-    @printf("minimum step gamma = %.4e\n", minimum_gamma)
-    @printf("step gamma reduce factor = %.4e\n", reduce_gamma)
-    @printf("step gamma increase factor = %.4e\n", increase_gamma)
-end
-@printf("max iterations = %d\n", max_iter)
-@printf("tolerance = %.4e\n", pgm_tol)
+# @printf("Moreau mu = %.4e\n", mu)
+# @printf("initial splitting gamma = %.4e\n", gamma)
+# @printf("relaxation = %.4e\n", relaxation)
+# @printf("Line search = %s\n", line_search ? "on" : "off")
+# if line_search
+#     @printf("minimum step gamma = %.4e\n", minimum_gamma)
+#     @printf("step gamma reduce factor = %.4e\n", reduce_gamma)
+#     @printf("step gamma increase factor = %.4e\n", increase_gamma)
+# end
+# @printf("max iterations = %d\n", max_iter)
+# @printf("tolerance = %.4e\n", pgm_tol)
 
 pgm_data = Dict{String,Any}()
 pgm_time = @elapsed pgm_U, pgm_X, J_pgm_smooth = solve_pgm(x0; data = pgm_data, verbose = true)

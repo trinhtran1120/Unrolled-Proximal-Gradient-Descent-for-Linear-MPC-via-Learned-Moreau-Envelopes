@@ -40,8 +40,8 @@ function state_constraints(problem::LinearMPC, x0 = nothing)
 
     x_free = problem.A_ro * x0
     b_state = [
-        fill(problem.xmax, problem.nx * problem.N) - x_free;
-        -fill(problem.xmin, problem.nx * problem.N) + x_free
+        repeat_horizon(problem.xmax, problem.N) - x_free;
+        -repeat_horizon(problem.xmin, problem.N) + x_free
     ]
 
     return Gx, b_state
@@ -72,22 +72,24 @@ function single_shooting_cost(problem::LinearMPC, x0::Vector{Float64})
     B_ro = problem.B_ro
     Q = problem.Q
     R = problem.R
+    xr = problem.xr
             
     H = zeros(Float64, N*nu, N*nu)
     h = zeros(Float64, N*nu)
 
-    for k in 1:N-1
+    for k in 1:N
         x_idx = ((k - 1) * nx + 1) : (k * nx)
         Ak = view(A_ro, x_idx, :)
         Bk = view(B_ro, x_idx, :)
+        dx_free = Ak * x0 - xr
 
-        H .+= Bk' * Q * Bk
-        h .+= Bk' * Q * Ak * x0
+        H .+= 2.0 .* (Bk' * Q * Bk)
+        h .+= 2.0 .* (Bk' * Q * dx_free)
     end
 
     for k in 1:N
         u_idx = ((k - 1) * nu + 1) : (k * nu)
-        H[u_idx, u_idx] .+= R 
+        H[u_idx, u_idx] .+= 2.0 .* R 
     end
 
     return DifferentiableQuadratic(H, h)
@@ -98,7 +100,9 @@ function cost_cache(problem::LinearMPC, x0::Vector{Float64})
     f = single_shooting_cost(problem, x0)
     zero_U = zeros(Float64, problem.nu, problem.N)
     zero_X = rollout(problem, x0, zero_U)
-    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N)
+    zero_u = zeros(Float64, problem.nu)
+    constant_cost = sum(problem.cost_func(zero_X[:, k], zero_U[:, k]) for k in 1:problem.N) +
+                    problem.cost_func(zero_X[:, problem.N+1], zero_u)
     return f, constant_cost
 end
 
@@ -205,8 +209,12 @@ function StateConstraint(name::String, problem::LinearMPC, tol::Float64)
 
     # State bound
     X = A_ro * x0 + B_ro * V
-    @constraint(model, X .<= fill(xmax, nx* N))
-    @constraint(model, fill(xmin, nx*N) .<= X)
+    upper_X = repeat_horizon(xmax, N)
+    lower_X = repeat_horizon(xmin, N)
+    finite_upper = findall(isfinite, upper_X)
+    finite_lower = findall(isfinite, lower_X)
+    @constraint(model, X[finite_upper] .<= upper_X[finite_upper])
+    @constraint(model, lower_X[finite_lower] .<= X[finite_lower])
     @objective(model, Min, 0.5*sum((V[i] - U_ref[i])^2 for i in 1:N*nu))
 
     function solver(init::Vector{Float64}, q::AbstractVector{Float64}; verbose=false)
@@ -325,8 +333,8 @@ function PGM_solver(
     N = problem.N
     nU = nu * N
     Z0 = zeros(Float64, nU)
-    lower_U = fill(problem.umin, nU)
-    upper_U = fill(problem.umax, nU)
+    lower_U = repeat_horizon(problem.umin, N)
+    upper_U = repeat_horizon(problem.umax, N)
     project = StateConstraint("OSQP", problem, 1e-6)
 
     return @inbounds function solver(x0::Vector{Float64}; data = nothing, verbose = false)
