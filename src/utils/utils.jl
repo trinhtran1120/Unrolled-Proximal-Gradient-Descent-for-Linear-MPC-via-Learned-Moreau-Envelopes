@@ -75,6 +75,12 @@ function load_projection_mlp(path::AbstractString)
     )
 end
 
+function affine_projection(model::ProjectionMLP, z_bar::AbstractVector, b::AbstractVector)
+    residual = model.E * z_bar .- b
+    ldiv!(cholesky!(Symmetric(model.E * model.E')), residual)
+    return z_bar .- model.E' * residual
+end
+
 function projection_mlp_forward(model::ProjectionMLP, input::AbstractVector, parameter::AbstractVector)
     z = vcat(input, parameter)
     for layer in 1:length(model.weights)-1
@@ -82,7 +88,8 @@ function projection_mlp_forward(model::ProjectionMLP, input::AbstractVector, par
     end
     z_bar = model.weights[end] * z .+ model.biases[end]
     b = model.b_offset .+ model.b_theta * parameter[1:size(model.b_theta, 2)]
-    z_hat = z_bar .- model.E_pinv * (model.E * z_bar .- b)
+    z_hat = affine_projection(model, z_bar, b)
+    # z_hat = z_bar .- model.E_pinv * (model.E * z_bar .- b)
     # z_hat = z_bar
     return z_hat[1:model.input_dim], z_hat[model.input_dim + 1:end]
 end

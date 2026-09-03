@@ -119,7 +119,7 @@ J_learned, _ = evaluate_cost_gradient(mpc_data, x0, learned_sol.U)
 @printf("max constraint violation = %8.4e\n", max_constraint_violation(mpc_data, learned_sol.U, learned_sol.X))
 @printf("max |solver U - learned PGM U| = %8.4e\n", maximum(abs.(opt_U - learned_sol.U)))
 @printf("max |solver X - learned PGM X| = %8.4e\n", maximum(abs.(opt_X - learned_sol.X)))
-@printf("learned TOS backtracks = %d\n\n", sum(learned_sol.backtrack_history))
+# @printf("learned TOS backtracks = %d\n\n", sum(learned_sol.backtrack_history))
 
 # println("---------------- repeated timing ----------------")
 # solver_times = zeros(Float64, benchmark_samples)
